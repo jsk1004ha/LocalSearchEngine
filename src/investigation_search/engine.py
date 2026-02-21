@@ -6,7 +6,7 @@ from typing import Dict, Iterable, List, Optional
 from .embedding import DEFAULT_EMBEDDING_MODEL
 from .index_ann import ANNIndex
 from .reranker import LocalCrossEncoderReranker, Reranker
-from .retrieval import build_passes, retrieve
+from .retrieval import build_disconfirming_pass, build_passes, retrieve
 from .schema import EvidenceUnit, ScoredEvidence, SearchResult, Verdict
 
 
@@ -85,6 +85,28 @@ class InvestigationEngine:
         contradictions = [s for s in best if s.verdict == Verdict.CONTRADICTS]
         supports = [s for s in best if s.verdict == Verdict.SUPPORTS]
 
+        if not contradictions and best:
+            elapsed = time.time() - start
+            remaining = time_budget_sec - elapsed
+            if remaining > 0:
+                disconfirming_pass = build_disconfirming_pass(query)
+                extra_hits = retrieve(
+                    disconfirming_pass,
+                    self.evidence_units,
+                    top_k=top_k_per_pass,
+                    ann_index=self.ann_index,
+                    embedding_model=self.embedding_model,
+                )
+                selected.extend(extra_hits)
+                pass_stats[disconfirming_pass.name] = f"{len(extra_hits)} hits"
+                reranked = self._rerank(query, selected) if extra_hits else reranked
+                reranked.sort(key=lambda s: s.score, reverse=True)
+                best = reranked[: max(top_k_per_pass, 3)]
+                contradictions = [s for s in best if s.verdict == Verdict.CONTRADICTS]
+                supports = [s for s in best if s.verdict == Verdict.SUPPORTS]
+            else:
+                pass_stats["pass_d_disconfirming"] = "skipped_time_budget"
+
         if supports:
             answer = supports[0].evidence.content
         elif best:
@@ -94,6 +116,13 @@ class InvestigationEngine:
 
         if not contradictions and best:
             pass_stats["disconfirming_check"] = "insufficient_contradicting_evidence"
+
+        support_confidence = max((s.score for s in supports), default=0.0)
+        contradiction_confidence = max((s.score for s in contradictions), default=0.0)
+        pass_stats["evidence_confidence"] = {
+            "supports": round(support_confidence, 4),
+            "contradicts": round(contradiction_confidence, 4),
+        }
 
         pass_stats["rerank"] = rerank_meta
         pass_stats["elapsed_sec"] = f"{time.time() - start:.3f}"

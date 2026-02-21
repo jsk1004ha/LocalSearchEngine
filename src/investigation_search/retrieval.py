@@ -7,6 +7,7 @@ from typing import Iterable, List, Sequence
 from .embedding import DEFAULT_EMBEDDING_MODEL, encode_texts
 from .index_ann import ANNIndex, search_index
 from .schema import EvidenceUnit, ScoredEvidence, Verdict
+from .verification import infer_claim_evidence_relation
 
 
 _WORD_RE = re.compile(r"[a-zA-Z0-9가-힣]+")
@@ -15,6 +16,7 @@ _WORD_RE = re.compile(r"[a-zA-Z0-9가-힣]+")
 @dataclass(frozen=True)
 class QueryPass:
     name: str
+    claim: str
     query: str
 
 
@@ -24,10 +26,14 @@ def tokenize(text: str) -> List[str]:
 
 def build_passes(query: str) -> Sequence[QueryPass]:
     return (
-        QueryPass("pass_a_support", query),
-        QueryPass("pass_b_contradict", f"{query} 하지만 예외 제한 반대 근거"),
-        QueryPass("pass_c_boundary", f"{query} 조건 시점 대상 변경"),
+        QueryPass("pass_a_support", query, query),
+        QueryPass("pass_b_contradict", query, f"{query} 하지만 예외 제한 반대 근거"),
+        QueryPass("pass_c_boundary", query, f"{query} 조건 시점 대상 변경"),
     )
+
+
+def build_disconfirming_pass(query: str) -> QueryPass:
+    return QueryPass("pass_d_disconfirming", query, f"{query} 부정 예외 반증 제한 실패")
 
 
 def lexical_score(query: str, text: str) -> float:
@@ -39,13 +45,21 @@ def lexical_score(query: str, text: str) -> float:
     return inter / max(len(q), 1)
 
 
-def classify_verdict(pass_name: str, evidence_text: str) -> Verdict:
-    contradiction_hints = ["아니다", "없다", "제한", "예외", "반면", "불가"]
-    support_hints = ["가능", "효과", "충족", "성공", "개선"]
+def classify_verdict(pass_name: str, claim: str, evidence_text: str, contradiction_threshold: float = 0.5) -> Verdict:
+    support_hints = ["가능", "효과", "충족", "성공", "개선", "향상"]
+    relation = infer_claim_evidence_relation(claim=claim, evidence=evidence_text)
+    contradiction_prob = relation.contradict
 
-    if pass_name == "pass_b_contradict" or any(k in evidence_text for k in contradiction_hints):
+    if pass_name in {"pass_b_contradict", "pass_d_disconfirming"}:
+        disconfirm_relation = infer_claim_evidence_relation(
+            claim=f"{claim} 아니다 예외 제한",
+            evidence=evidence_text,
+        )
+        contradiction_prob = max(contradiction_prob, disconfirm_relation.contradict)
+
+    if contradiction_prob >= contradiction_threshold:
         return Verdict.CONTRADICTS
-    if any(k in evidence_text for k in support_hints):
+    if relation.entail >= 0.45 or any(k in evidence_text for k in support_hints):
         return Verdict.SUPPORTS
     return Verdict.UNCERTAIN
 
@@ -68,13 +82,17 @@ def retrieve(
         score = lexical_score(query_pass.query, unit.content)
         if score <= 0:
             continue
-        verdict = classify_verdict(query_pass.name, unit.content)
+        relation = infer_claim_evidence_relation(claim=query_pass.claim, evidence=unit.content)
+        verdict = classify_verdict(query_pass.name, query_pass.claim, unit.content)
         lexical_hits.append(
             ScoredEvidence(
                 evidence=unit,
                 score=score,
                 verdict=verdict,
-                why_it_matches=f"{query_pass.name}: lexical 키워드 중첩 {score:.2f}",
+                why_it_matches=(
+                    f"{query_pass.name}: lexical {score:.2f}, "
+                    f"entail={relation.entail:.2f}, contradict={relation.contradict:.2f}"
+                ),
             )
         )
 
@@ -92,7 +110,7 @@ def retrieve(
                 ScoredEvidence(
                     evidence=unit,
                     score=dense_score,
-                    verdict=classify_verdict(query_pass.name, unit.content),
+                    verdict=classify_verdict(query_pass.name, query_pass.claim, unit.content),
                     why_it_matches=f"{query_pass.name}: dense 유사도 {dense_score:.2f}",
                 )
             )

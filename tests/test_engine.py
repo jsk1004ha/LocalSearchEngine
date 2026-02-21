@@ -14,7 +14,8 @@ if "numpy" not in sys.modules:
     )
 
 from investigation_search.engine import InvestigationEngine
-from investigation_search.schema import EvidenceUnit, SourceType
+from investigation_search.retrieval import classify_verdict
+from investigation_search.schema import EvidenceUnit, SourceType, Verdict
 
 
 def _sample_units() -> list[EvidenceUnit]:
@@ -32,7 +33,7 @@ def _sample_units() -> list[EvidenceUnit]:
         EvidenceUnit(
             doc_id="doc-2",
             source_type=SourceType.TEXT_SENTENCE,
-            content="단, 예외 구간에서는 적용이 불가하고 제한이 있다.",
+            content="단, 예외 구간에서는 처리 속도 개선이 불가하고 제한이 있다.",
             section_path="A/2",
             char_start=26,
             char_end=53,
@@ -72,7 +73,7 @@ def test_search_rerank_enabled_adds_diagnostics_and_stage_scores() -> None:
 def test_search_rerank_skipped_when_time_budget_exceeded_keeps_sorted_scores() -> None:
     engine = InvestigationEngine(_sample_units())
 
-    fake_times = [0.0, 0.0, 0.0, 0.0, 119.995, 120.0]
+    fake_times = [0.0, 0.0, 0.0, 0.0, 119.995, 120.0, 120.0, 120.0]
     with patch("investigation_search.engine.time.time", side_effect=fake_times):
         result = engine.search("처리 속도 개선", top_k_per_pass=2, time_budget_sec=120)
 
@@ -83,3 +84,53 @@ def test_search_rerank_skipped_when_time_budget_exceeded_keeps_sorted_scores() -
 
     scores = [item.score for item in result.evidence]
     assert scores == sorted(scores, reverse=True)
+
+
+def test_supports_and_contradicts_cases_are_separated() -> None:
+    supports = classify_verdict(
+        "pass_a_support",
+        "처리 속도 개선",
+        "정책 변경으로 처리 속도 개선 효과가 확인되었다.",
+    )
+    contradicts = classify_verdict(
+        "pass_b_contradict",
+        "처리 속도 개선",
+        "예외 구간에서는 처리 속도 개선이 불가하고 제한이 있다.",
+    )
+
+    assert supports == Verdict.SUPPORTS
+    assert contradicts == Verdict.CONTRADICTS
+
+
+def test_disconfirming_extra_query_runs_when_no_initial_contradiction() -> None:
+    units = [
+        EvidenceUnit(
+            doc_id="doc-s1",
+            source_type=SourceType.TEXT_SENTENCE,
+            content="실험 결과 처리 속도 개선 효과가 반복적으로 확인되었다.",
+            section_path="B/1",
+            char_start=0,
+            char_end=30,
+            timestamp="2024-01-01T00:00:00Z",
+            confidence=0.95,
+        ),
+        EvidenceUnit(
+            doc_id="doc-s2",
+            source_type=SourceType.TEXT_SENTENCE,
+            content="적용 범위를 확장하면 처리량과 안정성이 함께 향상된다.",
+            section_path="B/2",
+            char_start=31,
+            char_end=60,
+            timestamp="2024-01-01T00:00:00Z",
+            confidence=0.85,
+        ),
+    ]
+    engine = InvestigationEngine(units)
+
+    result = engine.search("처리 속도 개선", top_k_per_pass=2, time_budget_sec=120)
+
+    assert "pass_d_disconfirming" in result.diagnostics
+    assert result.diagnostics["disconfirming_check"] == "insufficient_contradicting_evidence"
+    assert "evidence_confidence" in result.diagnostics
+    assert result.diagnostics["evidence_confidence"]["supports"] >= 0.0
+    assert result.diagnostics["evidence_confidence"]["contradicts"] == 0.0
