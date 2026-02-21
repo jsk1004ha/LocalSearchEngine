@@ -12,8 +12,11 @@ from .engine import InvestigationEngine
 from .entity import AliasCandidate, generate_alias_candidates, normalize_masked_entity
 from .evaluation import EvaluationCase, EvaluationReport, compare_reports, evaluate_engine
 from .index_ann import build_index, load_index, save_index, search_index
+from .library import KnowledgeLibrary
 from .learning import LearningConfig, LearningState, OnlineLearningManager
+from .modes import ModeProfile, SearchMode, build_passes_for_mode, parse_mode, profile_for_mode
 from .ollama import OllamaClient, OllamaContradictionDetector, OllamaRerankerAdapter
+from .osint import build_osint_graph, extract_timeline
 from .parser import DocumentParser, ParseConfig, parse_documents
 from .reranker import LocalCrossEncoderReranker, OnnxRerankerAdapter
 from .offline import (
@@ -67,6 +70,14 @@ __all__ = [
     "LearningConfig",
     "LearningState",
     "OnlineLearningManager",
+    "KnowledgeLibrary",
+    "SearchMode",
+    "ModeProfile",
+    "parse_mode",
+    "profile_for_mode",
+    "build_passes_for_mode",
+    "build_osint_graph",
+    "extract_timeline",
     "EvaluationCase",
     "EvaluationReport",
     "evaluate_engine",

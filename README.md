@@ -1,83 +1,86 @@
 # Local Investigation Search Engine
 
-개인용 PC 환경에서 동작하는 **조사형 검색 엔진(Investigation Search Engine)**의 최소 구현체입니다.
-목표는 단순 유사도 검색이 아니라 아래 4가지를 함께 반환하는 것입니다.
+로컬 PC 환경에서 돌아가는 **조사형(Investigation) 검색 엔진**입니다.  
+단순 “유사 문장 찾기”가 아니라, 질문에 대해 **결론 + 근거 + 출처 + 반례/모순 + 설명가능한 진단**을 함께 반환하는 것을 목표로 합니다.
 
-1. 결론(Answer)
-2. 근거(Evidence spans)
-3. 출처(Citations)
-4. 반례/모순(Disconfirming evidence)
+## TL;DR
 
-## 구현된 핵심 설계
+- 오프라인 인덱싱(임베딩/ANN/BM25) + 온라인 멀티패스 하이브리드 검색
+- 모든 결과에 `SourceCitation`(출처) 포함
+- 모순(contradiction) 전용 단계 + reranker 단계
+- 검색 DSL(필터) + explain/하이라이트 + 평가 하니스
+- 온라인 학습(가중치/토큰 boost) + 사용자 검색정보 삭제 API
+- 로컬 근거 부족 시 DuckDuckGo `web_snippet` fallback(옵션)
 
-- **오프라인 지식 빌드**
-  - `knowledge_build_id` 생성(코퍼스 스냅샷/파서 버전/임베딩 버전 결합)
-  - evidence 산출물 체크섬 포함 매니페스트 생성
-  - `previous_build_dir` 기반 증분 임베딩 재사용(reused/new 벡터 통계 기록)
-  - 해시 기반 샤딩 산출물(`shards/shard_xxx`) 생성 및 로딩 지원
-  - BM25 인덱스(`bm25_index.json`) 저장/로드 지원(재시작 비용 절감)
-- **근거 단위 스키마**
-  - `text_sentence`, `table_cell`, `caption`, `ocr_text` source type 지원
-  - 문서 위치(`section_path`, `char_start`, `char_end`)와 신뢰도(`confidence`) 저장
-  - 모든 `ScoredEvidence`/`SearchResult`에 `SourceCitation` 포함(`answer_sources`, `sources`)
+## 목차
+
+- [왜 필요한가](#왜-필요한가)
+- [주요 기능](#주요-기능)
+- [빠른 시작](#빠른-시작)
+- [설치](#설치)
+- [사용법](#사용법)
+- [검색 DSL](#검색-dsl)
+- [검색 모드](#검색-모드)
+- [지식도서관](#지식도서관)
+- [설정](#설정)
+- [개인정보/데이터](#개인정보데이터)
+- [문제 해결](#문제-해결)
+- [평가](#평가)
+- [지원](#지원)
+- [라이선스](#라이선스)
+- [변경 로그](#변경-로그)
+
+## 왜 필요한가
+
+조사/리서치 상황에서는 “가장 그럴듯한 문장”보다 아래가 더 중요합니다.
+
+- **무엇을 근거로 결론을 냈는지**(출처/스팬/맥락)
+- **반례나 조건부 예외**가 있는지(모순/반증 탐색)
+- **왜 그 근거가 선택됐는지**(설명가능한 점수/진단)
+- 운영 관점에서 **재현 가능**하고 **삭제 가능**해야 함(오프라인 빌드, 개인정보 제어)
+
+## 주요 기능
+
+- **오프라인 빌드**
+  - evidence units(`evidence_units.json`)
+  - embeddings(`evidence_embeddings.npy`) + ANN(`ann_index.*`)
+  - BM25(`bm25_index.json`) 저장/로드
+  - 샤딩 아티팩트(`shards/shard_xxx/*`)
+  - 증분 임베딩 재사용(`previous_build_dir`)
 - **온라인 멀티패스 하이브리드 검색**
-  - Pass A: 정방향
-  - Pass B: 반증(예외/제한/반대 근거 탐색)
-  - Pass C: 경계조건(대상/시점/조건 변경)
-  - 검색 DSL(`doc:`, `source:`, `-source:`, `after:`, `before:`, `section:`) 지원
-  - BM25 + Dense + lexical + RRF 융합 스코어
-  - cross-encoder 스타일 reranker 후 최종 점수 반영
+  - Pass A(정방향) / Pass B(반증) / Pass C(경계조건)
+  - BM25 + dense + lexical + RRF 융합 점수
   - 남은 time budget에 따라 후보 수 동적 조절
-  - reranker는 상위 후보만 선택적으로 적용(max_rerank_candidates)
-- **분석기(Analyzer) 단일화**
-  - BM25/lexical/reranker/contradiction/learning 전부 공통 토크나이저 사용
-  - 한국어는 문자 n-gram 기본 지원, 형태소 분석은 옵션(`konlpy` 설치 시)
-- **Evidence 품질 가중치**
-  - `confidence`/`source_type`/`timestamp`를 prior로 반영
-  - 저신뢰 OCR 자동 하향(또는 제거), 짧은 table cell 패널티, 최신성 가중 옵션
-- **모순 검출 전용 단계**
-  - `ContradictionDetector` 인터페이스와 기본 로컬 heuristic detector
-  - NLI/ONNX 런타임 어댑터로 전용 모델 연동 가능
-- **진단 정보(Diagnostics)**
-  - 각 pass hit 수, 실행 시간, time budget, 반례 근거 부족 여부 표기
-  - rerank 적용/생략 사유, contradiction detector 오버라이드 수, cache hit/miss 포함
+  - reranker는 상위 후보만 선택 적용(`max_rerank_candidates`)
+- **모순 검출 단계**
+  - `ContradictionDetector` 인터페이스
+  - 기본 heuristic detector
+  - ONNX 또는 Ollama 기반 detector 어댑터
+- **출처(Citations)**
+  - 모든 `ScoredEvidence`/`SearchResult`에 `SourceCitation` 포함
+  - `answer_sources`, `sources` 제공
 - **Explain/하이라이트**
   - `engine.explain(result)`로 근거별 score/why/stage를 구조화 출력
-  - `render_result_text()`로 하이라이트된 근거 텍스트 뷰 출력
-- **검색 중 온라인 학습**
-  - 검색 결과의 stage score를 이용해 BM25/dense/lexical/RRF 가중치를 점진 업데이트
-  - query token boost를 누적 학습하여 다음 검색의 lexical/BM25 스코어에 반영
-  - 학습 상태 파일(JSON) 로드/저장 지원
-  - `delete_user_search_data()`로 캐시/학습 상태 즉시 삭제 가능
-- **Ollama 로컬 모델 연동**
-  - `ollama:<model>` 임베딩 모델명으로 dense 임베딩을 Ollama `/api/embed`로 생성
-  - `OllamaRerankerAdapter`, `OllamaContradictionDetector`로 reranker/NLI 연결
-- **웹 fallback 검색 (DuckDuckGo)**
-  - 로컬 근거가 부족할 때 DuckDuckGo 결과를 `web_snippet` 근거로 자동 병합
-  - DSL에서 `-source:web_snippet`로 외부 검색 결과 제외 가능
-- **엔터티 정규화/집계**
-  - 이름/닉네임/아이디/메일 마스킹 표기를 정규화하고 alias 후보를 query expansion에 반영
-  - alias 확장 점수 페널티로 오탐을 제어하고 evidence metadata의 `canonical_entity_id` 기준 그룹 집계 지원
-- **문서 파서 확장**
-  - TXT/MD/CSV + PDF(text/table) + 이미지 OCR 파싱
-  - `DocumentParser`/`parse_documents()`로 근거 단위 자동 생성
-
-## 의존성
-
-기본 검색 경로는 표준 라이브러리만으로 동작하며, 아래는 선택 의존성입니다.
-
-- `numpy`
-- `sentence-transformers`
-- `hnswlib` 또는 `faiss-cpu` (없으면 exact fallback)
-- PDF 파서: `pdfplumber` 또는 `pypdf`
-- OCR: `pillow`, `pytesseract` (+ 시스템 tesseract 설치)
-- Ollama 연동: 로컬 `ollama serve` 실행
-- 웹 fallback: DuckDuckGo 접근 가능 네트워크
-- 형태소 분석(옵션): `konlpy`
+  - `render_result_text()`로 하이라이트된 텍스트 뷰 출력
+- **검색 DSL**
+  - `doc:`, `source:`, `-source:`, `after:`, `before:`, `section:`
+- **검색 모드**
+  - `investigation`(조사), `reporter`(기자), `fbi`(OSINT), `collection`(자료), `sniper`(핵심), `rumor`(찌라시), `library`(신뢰)
+- **지식도서관**
+  - 모든 모드 결과를 로컬 저장소에 자동 저장(옵션)
+- **온라인 학습 + 삭제**
+  - stage score 기반 가중치/토큰 boost 점진 업데이트
+  - `delete_user_search_data()`로 캐시/학습 상태 즉시 삭제
+- **웹 fallback (옵션)**
+  - 로컬 근거가 부족할 때 DuckDuckGo 결과를 `web_snippet` 근거로 병합
+  - DSL에서 `-source:web_snippet`로 외부 결과 제외 가능
 
 ## 빠른 시작
 
-```bash
+로컬 패키지 경로를 위해 `PYTHONPATH=src`로 실행합니다.
+
+```powershell
+$env:PYTHONPATH="src"
 python - <<'PY'
 from investigation_search import EvidenceUnit, InvestigationEngine, SourceType
 
@@ -85,146 +88,210 @@ units = [
     EvidenceUnit(
         doc_id="doc-1",
         source_type=SourceType.TEXT_SENTENCE,
-        content="로컬 검색 파이프라인은 오프라인 사전 인덱싱으로 지연을 줄일 수 있다.",
+        content="오프라인 인덱싱은 검색 지연을 줄일 수 있다.",
         section_path="1.개요",
         char_start=0,
-        char_end=36,
+        char_end=23,
         timestamp="2026-01-01T00:00:00Z",
         confidence=0.95,
     ),
     EvidenceUnit(
         doc_id="doc-2",
         source_type=SourceType.TEXT_SENTENCE,
-        content="하지만 작은 메모리 환경에서는 고차원 인덱스가 제한될 수 있다.",
+        content="단, 메모리 환경에서는 인덱스 크기 제한이 발생할 수 있다.",
         section_path="2.제한",
         char_start=0,
-        char_end=34,
+        char_end=35,
         timestamp="2026-01-01T00:00:00Z",
         confidence=0.92,
     ),
 ]
 
 engine = InvestigationEngine(units, build_id="example-build")
-result = engine.search("오프라인 인덱싱으로 지연 개선 가능한가")
+result = engine.search('오프라인 인덱싱으로 지연 개선 가능한가')
 
 print("answer:", result.answer)
 print("answer_sources:", [s.citation_id for s in result.answer_sources])
 print("sources:", [s.citation_id for s in result.sources])
-print("diagnostics:", result.diagnostics)
 print("contradictions:", len(result.contradictions))
+print("diagnostics_keys:", sorted(result.diagnostics.keys()))
 PY
 ```
 
-> 위 예시는 로컬 패키지 경로를 위해 `PYTHONPATH=src` 또는 설치 후 실행해야 합니다.
+## 설치
 
+### 필수
 
-## 임베딩/ANN 권장 설정 (CPU)
+- Python 3.11+
 
-- 권장 임베딩 모델
-  - `intfloat/multilingual-e5-small` (384d, 한국어/영어 혼합 질의에 안정적)
-  - `BAAI/bge-small-en-v1.5` (384d, 영문 중심 코퍼스)
-- 권장 인덱스
-  - 기본: HNSW (`M=32`, `ef_construction=200`, `ef_search=64`)
-  - 대규모 데이터(수백만 단위): FAISS IVF (`nlist=256` 이상)
-- 메모리 가이드(대략)
-  - 임베딩 행렬: `문서수 N * 384 * 4 bytes` (float32)
-    - 예: 100,000 span ≈ 146MB
-  - HNSW 그래프 오버헤드: 데이터 분포에 따라 임베딩 메모리의 약 1.2~2.0배 추가
-  - 운영시 여유 메모리(파이썬 런타임/버퍼 포함)로 최소 2~3배를 권장
+### 선택(기능별)
 
-오프라인 빌드 시 `write_build()`는 다음 산출물을 생성합니다.
+- Dense 임베딩/ANN: `numpy`, `sentence-transformers`, `hnswlib` 또는 `faiss-cpu`
+- PDF: `pdfplumber` 또는 `pypdf`
+- OCR: `pillow`, `pytesseract` (+ 시스템 tesseract 설치)
+- Ollama: 로컬 `ollama serve`
+- 형태소 분석(옵션): `konlpy` (Analyzer가 자동으로 있으면 사용)
 
-- `evidence_units.json`
-- `evidence_embeddings.npy`
-- `ann_index.bin`(또는 fallback 시 `ann_index.npy`) + `ann_index.meta.json`
-- `bm25_index.json`
-- `manifest.json`
-- (옵션) `shards/shard_xxx/*` 분할 아티팩트
+예시:
 
-온라인 검색은 lexical 후보와 ANN 후보를 합쳐 `doc_id + (char_start, char_end)` 기준으로 중복 병합한 뒤 재랭킹합니다.
+```powershell
+pip install -U numpy sentence-transformers hnswlib
+pip install -U pdfplumber pillow pytesseract
+```
 
-## Ollama 연동 예시
+## 사용법
+
+### 1) 오프라인 빌드
 
 ```python
-from investigation_search import (
-    InvestigationEngine,
-    OllamaContradictionDetector,
-    OllamaRerankerAdapter,
-)
+from pathlib import Path
+from investigation_search import build_manifest, write_build
+
+manifest = build_manifest(units, corpus_snapshot_id="snap-2026-01-01", parser_version="2.0", embedding_model="intfloat/multilingual-e5-small")
+write_build(Path("artifacts/build"), units, manifest, shard_count=4, previous_build_dir=None)
+```
+
+### 2) 검색
+
+```python
+result = engine.search("조건 변경 시 성능 향상 가능한가", top_k_per_pass=5, time_budget_sec=120)
+```
+
+### 3) Explain/렌더링
+
+```python
+from investigation_search import render_result_text
+
+print(render_result_text(result, query="조건 변경 시 성능 향상 가능한가"))
+print(engine.explain(result, max_items=5))
+```
+
+## 검색 DSL
+
+예시:
+
+- `doc:report_2026 source:table after:2026-01-01 "매출 증가"`
+- `-source:ocr "내부 문서에서만 찾기"`
+- `section:page/3 "핵심 결론"`
+
+지원 연산자:
+
+- `doc:<doc_id>`
+- `source:<text|table|caption|ocr|web_snippet|...>`
+- `-source:<...>`
+- `after:<YYYY-MM-DD|ISO8601>`
+- `before:<YYYY-MM-DD|ISO8601>`
+- `section:<prefix>`
+
+## 검색 모드
+
+`engine.search()`에 `mode=`를 지정합니다.
+
+```python
+result = engine.search("주제", mode="investigation")  # 기본 조사 모드
+result = engine.search("주제", mode="reporter")        # 폭넓은 수집/요약
+result = engine.search("주제", mode="fbi")             # OSINT 중심(공개출처 기반)
+result = engine.search("주제", mode="collection")      # 자료/링크 중심
+result = engine.search("주제", mode="sniper")          # 1개 핵심 근거만
+result = engine.search("주제", mode="rumor")           # 다양한 주장 종합(진위 미확인 라벨)
+result = engine.search("주제", mode="library")         # 신뢰 소스 우선(기본: 로컬)
+```
+
+주의:
+
+- `fbi` 모드는 **공개 출처(OSINT) 기반**으로만 수집합니다. 스캔/침투/우회 같은 행위는 지원하지 않습니다.
+- `fbi` 모드는 `osint.graph`(관계도)와 `osint.timeline`(날짜 이벤트)을 diagnostics 및 지식도서관에 저장합니다.
+- `rumor` 모드는 진위와 무관하게 다양한 관점을 모으되, 결과를 **미확인**으로 표시합니다.
+
+## 지식도서관
+
+모든 검색 결과/근거를 하나의 로컬 저장소에 쌓아두고, 나중에 찾기 쉽게 보관합니다.
+
+```python
+from investigation_search import InvestigationEngine
 
 engine = InvestigationEngine(
     units,
-    embedding_model="ollama:nomic-embed-text",
-    reranker=OllamaRerankerAdapter(model="llama3.1:8b"),
-    contradiction_detector=OllamaContradictionDetector(model="llama3.1:8b"),
-    online_learning=True,
-    learning_state_path="artifacts/learning_state.json",
+    enable_knowledge_library=True,
+    knowledge_library_dir="artifacts/knowledge_library",
 )
+result = engine.search("주제", mode="reporter")
+```
 
-# 사용자 검색 정보 삭제(캐시 + 학습 상태)
+저장되는 것:
+
+- `artifacts/knowledge_library/sessions/<session_id>.json`: 검색 결과(모드/쿼리/출처/근거/진단)
+- `artifacts/knowledge_library/sessions.jsonl`: 세션 인덱스
+- `artifacts/knowledge_library/evidence/web_snippets.jsonl`: 웹 스니펫 근거(있을 때)
+- (옵션) `artifacts/knowledge_library/osint/<session_id>.json`: OSINT 아티팩트(모드에 따라)
+
+## 설정
+
+엔진 생성 시 주로 쓰는 옵션:
+
+- `retrieval_options`: `confidence/source_type/timestamp` 품질 prior, OCR 임계값, recency boost 등 (`src/investigation_search/retrieval.py`)
+- `max_rerank_candidates`: rerank 적용 후보 수 상한 (`src/investigation_search/engine.py`)
+- `online_learning`, `learning_state_path`: 검색 중 학습 on/off 및 상태 파일 (`src/investigation_search/learning.py`)
+- `enable_web_fallback`, `web_search_provider`: DuckDuckGo fallback on/off (`src/investigation_search/websearch.py`)
+- `enable_knowledge_library`, `knowledge_library_dir`: 지식도서관 저장 on/off (`src/investigation_search/library.py`)
+- `trusted_domains`: `library` 모드에서 허용할 웹 도메인 allowlist (`src/investigation_search/engine.py`)
+
+## 개인정보/데이터
+
+- 사용자 검색 정보는 **메모리 캐시**와 **학습 상태 JSON**에만 저장됩니다(설정 시).
+- 언제든 아래로 즉시 삭제할 수 있습니다:
+
+```python
 engine.delete_user_search_data(delete_learning_state_file=True)
 ```
 
-## DuckDuckGo fallback 예시
+- 지식도서관까지 함께 삭제하려면:
 
 ```python
-from investigation_search import DuckDuckGoSearchProvider, InvestigationEngine
-
-engine = InvestigationEngine(
-    units,
-    enable_web_fallback=True,
-    web_search_provider=DuckDuckGoSearchProvider(),
-    web_fallback_min_local_hits=1,
-    web_max_results=3,
-)
-
-# 외부 웹 결과 제외
-result = engine.search('-source:web_snippet "내부 문서에서만 찾기"')
+engine.delete_user_search_data(delete_learning_state_file=True, delete_knowledge_library=True)
 ```
 
-## 평가 Harness
+- 웹 fallback은 외부로 쿼리를 전송합니다. 개인정보가 민감하면:
+  - `enable_web_fallback=False` 또는
+  - DSL로 `-source:web_snippet` 사용
 
-- `evaluate_engine()`로 `Recall@k`, `MRR`, `nDCG@k`, `contradiction hit rate` 계산
-- `EvaluationCase`에 기대 citation/doc/모순 여부를 넣어 회귀 테스트 세트 구성
-- `compare_reports()`로 A/B 실험 성능 차이 계산
+## 문제 해결
 
-## 개인정보/삭제 정책
+자주 발생하는 이슈는 `TROUBLESHOOTING.md`에 정리했습니다.
 
-- 사용자 검색 정보는 엔진 캐시 및 학습 상태(JSON)에만 저장됩니다.
-- `delete_user_search_data()` 호출 시 메모리 캐시와 학습 데이터를 즉시 삭제합니다.
-- 파일 저장을 사용했다면 `delete_learning_state_file=True`로 파일까지 삭제할 수 있습니다.
+- `sentence-transformers가 필요합니다` 등 옵션 의존성 관련
+- HuggingFace 모델 다운로드 실패(프록시/오프라인 환경)
+- OCR/PDF/Ollama 연동 실패
+- DuckDuckGo 접근 차단/타임아웃
 
-## 안전 정책
+## 평가
 
-- 시스템 필수 안전 정책(플랫폼/법적 요구사항)은 비활성화할 수 없습니다.
-- 다만 엔진 내부에는 강제 검열 로직을 넣지 않았고, 운영 정책은 애플리케이션 레이어에서 조정 가능합니다.
+`evaluate_engine()`로 회귀 테스트용 지표를 계산합니다.
 
-## 프로젝트 구조
+```python
+from investigation_search import EvaluationCase, evaluate_engine
 
-- `src/investigation_search/schema.py`: 근거/판정/result 모델
-- `src/investigation_search/offline.py`: 오프라인 빌드 및 매니페스트
-- `src/investigation_search/retrieval.py`: BM25 + dense + lexical 하이브리드 후보 결합/중복 병합/판정
-- `src/investigation_search/analyzer.py`: 공통 토크나이저/언어 감지(한국어 n-gram 포함)
-- `src/investigation_search/dsl.py`: 검색 DSL 파싱/필터 적용
-- `src/investigation_search/bm25.py`: BM25 인덱스/검색
-- `src/investigation_search/learning.py`: 검색 중 온라인 학습(가중치/토큰 boost)
-- `src/investigation_search/ollama.py`: Ollama API 클라이언트 + reranker/contradiction 어댑터
-- `src/investigation_search/websearch.py`: DuckDuckGo 웹 검색 공급자/결과 스키마
-- `src/investigation_search/viewer.py`: 하이라이트/설명용 결과 렌더러
-- `src/investigation_search/evaluation.py`: 오프라인 품질 평가 하니스
-- `src/investigation_search/embedding.py`: 로컬 임베딩 모델 로더/인코딩
-- `src/investigation_search/index_ann.py`: ANN 인덱스 빌드/검색/저장/로딩
-- `src/investigation_search/contradiction.py`: 모순 검출 전용 detector 인터페이스/어댑터
-- `src/investigation_search/parser.py`: PDF/표/OCR 문서 파서
-- `src/investigation_search/engine.py`: 시간 예산 + cache + shard-aware 조사형 검색 실행기
-- `VERSION`: 프로젝트 버전
-- `agent.md`: 이 저장소에서 작업하는 에이전트용 운영 규칙
+cases = [
+    EvaluationCase(
+        query="처리 속도 개선",
+        relevant_doc_ids=("doc-1",),
+        expect_contradiction=True,
+        top_k=5,
+    )
+]
+report = evaluate_engine(engine, cases)
+print(report.metrics)
+```
 
-## 고도화 상태
+## 지원
 
-아래 항목은 현재 구현에 반영되어 있습니다.
+- 동작/설계 질문: 이 저장소의 이슈 트래커에 재현 가능한 예제와 함께 남겨주세요.
+- 보안/개인정보 관련: 민감 데이터는 첨부하지 말고, 재현 가능한 최소 사례만 공유하세요.
 
-- BM25 + Dense + reranker 하이브리드
-- 문서 파서 확장(PDF/표/OCR)
-- contradiction detection 전용 모델 인터페이스 + 기본 detector
-- 쿼리 캐시 + 샤딩 + 증분 빌드
+## 라이선스
+
+Apache-2.0 (see `LICENSE`)
+
+## 변경 로그
+
+`CHANGELOG.md` 참고 (`VERSION`가 단일 소스)

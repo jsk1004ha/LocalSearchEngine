@@ -4,8 +4,10 @@ import hashlib
 import time
 from collections import defaultdict
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
 from typing import Dict, Iterable, List, Optional, Sequence
 
 from .bm25 import BM25Index
@@ -13,7 +15,10 @@ from .contradiction import ContradictionDetector, HeuristicContradictionDetector
 from .dsl import ParsedSearchQuery, SearchFilters, apply_search_filters, filter_to_dict, parse_search_query
 from .embedding import DEFAULT_EMBEDDING_MODEL
 from .index_ann import ANNIndex
+from .library import KnowledgeLibrary
 from .learning import LearningConfig, OnlineLearningManager
+from .modes import SearchMode, build_passes_for_mode, parse_mode, profile_for_mode
+from .osint import build_osint_graph, extract_timeline
 from .reranker import LocalCrossEncoderReranker, Reranker
 from .retrieval import (
     QueryPass,
@@ -71,6 +76,9 @@ class InvestigationEngine:
         web_fallback_min_local_hits: int = 1,
         web_max_results: int = 3,
         web_search_provider: WebSearchProvider | None = None,
+        enable_knowledge_library: bool = False,
+        knowledge_library_dir: str | Path = Path("artifacts") / "knowledge_library",
+        trusted_domains: Sequence[str] | None = None,
     ):
         self.evidence_units = list(evidence_units)
         self.build_id = build_id
@@ -89,6 +97,8 @@ class InvestigationEngine:
         self.web_fallback_min_local_hits = max(0, int(web_fallback_min_local_hits))
         self.web_max_results = max(1, int(web_max_results))
         self.web_search_provider = web_search_provider or DuckDuckGoSearchProvider()
+        self.trusted_domains = {d.strip().lower() for d in (trusted_domains or []) if str(d).strip()}
+        self._library = KnowledgeLibrary(knowledge_library_dir) if enable_knowledge_library else None
         self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
         self._learner = OnlineLearningManager(
             self.retrieval_weights,
@@ -125,8 +135,24 @@ class InvestigationEngine:
         query: str,
         top_k_per_pass: int = 5,
         time_budget_sec: int = 120,
+        *,
+        mode: str | SearchMode | None = None,
     ) -> SearchResult:
-        cache_key = self._cache_key(query=query, top_k_per_pass=top_k_per_pass, time_budget_sec=time_budget_sec)
+        mode_enum = parse_mode(mode)
+        profile = profile_for_mode(mode_enum)
+        effective_top_k = int(top_k_per_pass)
+        if mode_enum != SearchMode.INVESTIGATION:
+            effective_top_k = max(effective_top_k, profile.top_k_per_pass_min)
+        if mode_enum == SearchMode.SNIPER:
+            effective_top_k = 1
+        effective_retrieval_options = replace(self.retrieval_options, **dict(profile.retrieval_options_overrides))
+
+        cache_key = self._cache_key(
+            query=query,
+            top_k_per_pass=effective_top_k,
+            time_budget_sec=time_budget_sec,
+            mode=mode_enum.value,
+        )
         cached = self._cache_get(cache_key)
         if cached is not None:
             return self._with_cache_status(cached, status="hit", learning_meta=self._learner.snapshot())
@@ -149,6 +175,11 @@ class InvestigationEngine:
             "filters": filter_to_dict(parsed_query.filters),
             "phrase_terms": list(parsed_query.phrase_terms),
         }
+        pass_stats["mode"] = {
+            "name": mode_enum.value,
+            "description": profile.description,
+            "effective_top_k_per_pass": effective_top_k,
+        }
         pass_stats["retrieval_weights"] = {
             "bm25": active_weights.bm25,
             "dense": active_weights.dense,
@@ -156,7 +187,7 @@ class InvestigationEngine:
             "rrf": active_weights.rrf,
         }
 
-        for qp in build_passes(query_text):
+        for qp in build_passes_for_mode(query_text, mode_enum):
             elapsed = time.time() - start
             remaining = time_budget_sec - elapsed
             if remaining <= 0:
@@ -166,12 +197,13 @@ class InvestigationEngine:
             hits, shard_hits = self._retrieve_from_shards(
                 qp.query,
                 qp.name,
-                top_k=top_k_per_pass,
+                top_k=effective_top_k,
                 weights=active_weights,
                 token_boosts=active_token_boosts,
                 time_budget_sec=time_budget_sec,
                 elapsed_sec=elapsed,
                 filters=parsed_query.filters,
+                retrieval_options=effective_retrieval_options,
             )
             selected.extend(hits)
             pass_stats[qp.name] = {"hits": len(hits), "shards": shard_hits}
@@ -201,12 +233,12 @@ class InvestigationEngine:
                 rerank_meta["reason"] = "time_budget_exceeded"
                 reranked = self._annotate_initial_scores(selected)
             else:
-                reranked = self._rerank(query_text, selected)
+                reranked = self._rerank(query_text, selected, max_candidates=profile.max_rerank_candidates)
                 rerank_meta["reason"] = "applied"
                 rerank_meta["applied_count"] = int(
                     sum(1 for item in reranked if item.stage_scores.get("rerank_applied", 0.0) >= 0.5)
                 )
-                rerank_meta["max_rerank_candidates"] = self.max_rerank_candidates
+                rerank_meta["max_rerank_candidates"] = profile.max_rerank_candidates
 
         detector_meta = {
             "model": self.contradiction_detector.model_name,
@@ -217,7 +249,7 @@ class InvestigationEngine:
             reranked, detector_meta = self._apply_contradiction_detector(query_text, reranked, detector_meta)
 
         reranked.sort(key=lambda s: s.score, reverse=True)
-        best = reranked[: max(top_k_per_pass, 3)]
+        best = reranked[: max(effective_top_k, 3)]
 
         contradictions = [s for s in best if s.verdict == Verdict.CONTRADICTS]
         supports = [s for s in best if s.verdict == Verdict.SUPPORTS]
@@ -235,18 +267,25 @@ class InvestigationEngine:
         if not contradictions and best:
             pass_stats["disconfirming_check"] = "insufficient_contradicting_evidence"
 
+        enable_web = self.enable_web_fallback and profile.enable_web_fallback
         web_meta: dict[str, object] = {
-            "enabled": self.enable_web_fallback,
+            "enabled": enable_web,
             "provider": getattr(self.web_search_provider, "provider_name", None),
             "used": False,
             "reason": None,
             "result_count": 0,
         }
-        if self.enable_web_fallback and len(best) < self.web_fallback_min_local_hits:
+        should_web_search = profile.always_web_search or (len(best) < self.web_fallback_min_local_hits)
+        if enable_web and should_web_search:
             if self._web_allowed_by_filters(parsed_query.filters):
-                web_hits, web_meta = self._web_fallback(query_text, web_meta=web_meta)
+                web_hits, web_meta, web_rows = self._web_fallback(
+                    query_text,
+                    web_meta=web_meta,
+                    score_base=profile.web_score_base,
+                    max_results=profile.web_max_results,
+                )
                 if web_hits:
-                    best = self._merge_with_web(best, web_hits, top_n=max(top_k_per_pass, 3))
+                    best = self._merge_with_web(best, web_hits, top_n=max(effective_top_k, 3))
                     contradictions = [s for s in best if s.verdict == Verdict.CONTRADICTS]
                     supports = [s for s in best if s.verdict == Verdict.SUPPORTS]
                     if supports:
@@ -255,12 +294,26 @@ class InvestigationEngine:
                     elif best:
                         answer = best[0].evidence.content
                         answer_source = best[0].source or build_source_citation(best[0].evidence)
+                if mode_enum in {SearchMode.FBI, SearchMode.COLLECTION} and web_rows:
+                    pass_stats.setdefault("osint", {})
+                    pass_stats["osint"]["web_results"] = [
+                        {"rank": row.rank, "title": row.title, "url": row.url, "snippet": row.snippet}
+                        for row in web_rows
+                    ]
+                    if mode_enum == SearchMode.FBI:
+                        pass_stats["osint"]["graph"] = build_osint_graph(query_text, web_rows)
+                        pass_stats["osint"]["timeline"] = extract_timeline(web_rows, limit=30)
             else:
                 web_meta["reason"] = "filtered_out_by_query_dsl"
-        elif self.enable_web_fallback:
+        elif enable_web:
             web_meta["reason"] = "enough_local_hits"
         else:
             web_meta["reason"] = "disabled"
+
+        if profile.include_only_trusted_sources:
+            best = self._filter_trusted(best)
+            contradictions = [s for s in best if s.verdict == Verdict.CONTRADICTS]
+            supports = [s for s in best if s.verdict == Verdict.SUPPORTS]
 
         sources = self._collect_sources(best)
         if answer_source is not None:
@@ -276,8 +329,8 @@ class InvestigationEngine:
         pass_stats["time_budget_sec"] = str(time_budget_sec)
 
         result = SearchResult(
-            answer=answer,
-            evidence=best,
+            answer=self._format_answer_for_mode(mode_enum, answer=answer, best=best, supports=supports, contradictions=contradictions),
+            evidence=best[:1] if mode_enum == SearchMode.SNIPER else best,
             contradictions=contradictions,
             diagnostics=pass_stats,
             reranker_model=self.reranker.model_name,
@@ -287,6 +340,14 @@ class InvestigationEngine:
             sources=sources,
         )
         pass_stats["online_learning"] = self._learner.learn(query_text, best)
+        session_id = self._persist_to_library(
+            mode=mode_enum.value,
+            parsed_query=parsed_query,
+            result=result,
+            extra={"web_fallback": web_meta, "mode": pass_stats.get("mode"), "query_dsl": pass_stats.get("query_dsl")},
+        )
+        if session_id is not None:
+            pass_stats["knowledge_library_session_id"] = session_id
         self._cache_put(cache_key, result, created_at=end_ts)
         return result
 
@@ -303,12 +364,13 @@ class InvestigationEngine:
             for candidate in candidates
         ]
 
-    def _rerank(self, query: str, candidates: List[ScoredEvidence]) -> List[ScoredEvidence]:
-        if len(candidates) <= self.max_rerank_candidates:
+    def _rerank(self, query: str, candidates: List[ScoredEvidence], *, max_candidates: int) -> List[ScoredEvidence]:
+        max_candidates = max(1, int(max_candidates))
+        if len(candidates) <= max_candidates:
             rerank_indices = list(range(len(candidates)))
         else:
             ranked_by_score = sorted(range(len(candidates)), key=lambda idx: candidates[idx].score, reverse=True)
-            rerank_indices = ranked_by_score[: self.max_rerank_candidates]
+            rerank_indices = ranked_by_score[:max_candidates]
 
         rerank_subset = [candidates[idx] for idx in rerank_indices]
         rerank_scores = self.reranker.score(query, rerank_subset)
@@ -370,6 +432,7 @@ class InvestigationEngine:
         time_budget_sec: int,
         elapsed_sec: float,
         filters: SearchFilters,
+        retrieval_options: RetrievalOptions,
     ) -> tuple[List[ScoredEvidence], Dict[str, int]]:
         shard_hits: dict[str, int] = {}
         all_hits: list[ScoredEvidence] = []
@@ -394,7 +457,7 @@ class InvestigationEngine:
                 embedding_model=self.embedding_model,
                 weights=weights,
                 token_boosts=token_boosts,
-                options=self.retrieval_options,
+                options=retrieval_options,
                 dense_top_k_factor=dense_factor,
                 candidate_limit_factor=candidate_factor,
             )
@@ -514,12 +577,12 @@ class InvestigationEngine:
 
         return [build_bm25_for_units(units) for units in shard_units]
 
-    def _cache_key(self, *, query: str, top_k_per_pass: int, time_budget_sec: int) -> str:
+    def _cache_key(self, *, query: str, top_k_per_pass: int, time_budget_sec: int, mode: str) -> str:
         learning_bucket = self._learner.version // 10
         payload = (
             f"{self.build_id}|{self.embedding_model}|{self.shard_count}|"
             f"{top_k_per_pass}|{time_budget_sec}|{len(self.evidence_units)}|"
-            f"{learning_bucket}|{int(self.enable_web_fallback)}|{query.strip().lower()}"
+            f"{learning_bucket}|{int(self.enable_web_fallback)}|{mode}|{query.strip().lower()}"
         )
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
@@ -588,14 +651,25 @@ class InvestigationEngine:
     def clear_cache(self) -> None:
         self._cache.clear()
 
-    def delete_user_search_data(self, *, delete_learning_state_file: bool = True) -> Dict[str, object]:
+    def delete_user_search_data(
+        self,
+        *,
+        delete_learning_state_file: bool = True,
+        delete_knowledge_library: bool = False,
+    ) -> Dict[str, object]:
         cache_size = len(self._cache)
         self._cache.clear()
         self._learner.clear(delete_state_file=delete_learning_state_file)
+        library_deleted = False
+        if delete_knowledge_library and self._library is not None:
+            self._library.delete_all()
+            self._library = None
+            library_deleted = True
         return {
             "cache_entries_deleted": cache_size,
             "learning_state_reset": True,
             "learning_state_file_deleted": bool(delete_learning_state_file),
+            "knowledge_library_deleted": library_deleted,
         }
 
     def explain(self, result: SearchResult, *, max_items: int = 5) -> Dict[str, object]:
@@ -648,14 +722,16 @@ class InvestigationEngine:
         query: str,
         *,
         web_meta: Dict[str, object],
-    ) -> tuple[List[ScoredEvidence], Dict[str, object]]:
+        score_base: float,
+        max_results: int,
+    ):
         provider = self.web_search_provider
         try:
-            rows = provider.search(query, max_results=self.web_max_results)
+            rows = provider.search(query, max_results=max(1, int(max_results)))
         except Exception as exc:
             updated = dict(web_meta)
             updated["reason"] = f"error:{type(exc).__name__}"
-            return [], updated
+            return [], updated, []
 
         now_iso = datetime.now(timezone.utc).isoformat()
         hits: list[ScoredEvidence] = []
@@ -679,7 +755,8 @@ class InvestigationEngine:
                     "web_rank": rank,
                 },
             )
-            score = max(0.0, 1.0 - (rank - 1) * 0.12)
+            base = max(0.0, min(float(score_base), 1.0))
+            score = max(0.0, base - (rank - 1) * 0.06)
             hits.append(
                 ScoredEvidence(
                     evidence=unit,
@@ -695,7 +772,7 @@ class InvestigationEngine:
         updated["used"] = bool(hits)
         updated["result_count"] = len(hits)
         updated["reason"] = "applied" if hits else "no_results"
-        return hits, updated
+        return hits, updated, rows
 
     def _merge_with_web(
         self,
@@ -707,6 +784,91 @@ class InvestigationEngine:
         merged = list(local_hits) + list(web_hits)
         merged.sort(key=lambda item: item.score, reverse=True)
         return self._dedupe_candidates(merged)[: max(top_n, 1)]
+
+    def _format_answer_for_mode(
+        self,
+        mode: SearchMode,
+        *,
+        answer: str,
+        best: Sequence[ScoredEvidence],
+        supports: Sequence[ScoredEvidence],
+        contradictions: Sequence[ScoredEvidence],
+    ) -> str:
+        if mode == SearchMode.SNIPER:
+            return answer
+        if mode == SearchMode.RUMOR:
+            parts = ["[UNVERIFIED] 다양한 주장/관측을 요약합니다 (진위 미확인)."]
+            if supports:
+                parts.append("지지 근거:")
+                parts.extend(f"- {item.evidence.content}" for item in supports[:3])
+            if contradictions:
+                parts.append("반대/예외 근거:")
+                parts.extend(f"- {item.evidence.content}" for item in contradictions[:3])
+            if not supports and not contradictions and best:
+                parts.append("참고 근거:")
+                parts.extend(f"- {item.evidence.content}" for item in best[:3])
+            return "\n".join(parts)
+        if mode in {SearchMode.REPORTER, SearchMode.FBI}:
+            parts = ["요약:", f"- {answer}"]
+            if supports:
+                parts.append("주요 근거:")
+                parts.extend(f"- {item.evidence.content}" for item in supports[:3])
+            if contradictions:
+                parts.append("주의/반례:")
+                parts.extend(f"- {item.evidence.content}" for item in contradictions[:3])
+            return "\n".join(parts)
+        if mode == SearchMode.COLLECTION:
+            parts = ["자료/링크 후보:"]
+            for item in best[: min(len(best), 6)]:
+                url = item.evidence.metadata.get("url") or item.evidence.doc_id
+                title = item.evidence.metadata.get("title") or item.evidence.section_path
+                parts.append(f"- {title} ({url})")
+            return "\n".join(parts) if len(parts) > 1 else answer
+        return answer
+
+    def _filter_trusted(self, items: Sequence[ScoredEvidence]) -> List[ScoredEvidence]:
+        if not self.trusted_domains:
+            return [item for item in items if item.evidence.source_type != SourceType.WEB_SNIPPET]
+
+        trusted: list[ScoredEvidence] = []
+        for item in items:
+            if item.evidence.source_type != SourceType.WEB_SNIPPET:
+                trusted.append(item)
+                continue
+            url = str(item.evidence.metadata.get("url") or item.evidence.doc_id)
+            domain = urlparse(url).netloc.lower()
+            if domain and any(domain == td or domain.endswith("." + td) for td in self.trusted_domains):
+                trusted.append(item)
+        return trusted
+
+    def _persist_to_library(
+        self,
+        *,
+        mode: str,
+        parsed_query: ParsedSearchQuery,
+        result: SearchResult,
+        extra: Dict[str, object],
+    ) -> str | None:
+        if self._library is None:
+            return None
+        session_id = self._library.save_session(
+            mode=mode,
+            raw_query=parsed_query.raw_query,
+            clean_query=parsed_query.clean_query,
+            filters=filter_to_dict(parsed_query.filters),
+            result=result,
+            extra=extra,
+        )
+        web_units = [
+            item.evidence
+            for item in [*result.evidence, *result.contradictions]
+            if item.evidence.source_type == SourceType.WEB_SNIPPET
+        ]
+        if web_units:
+            self._library.append_evidence_units(web_units, tag="web_snippets")
+        if "osint" in result.diagnostics and isinstance(result.diagnostics.get("osint"), dict):
+            self._library.save_osint_artifacts(session_id, artifacts=result.diagnostics["osint"])
+        return session_id
 
     @staticmethod
     def _shard_for_doc(doc_id: str, shard_count: int) -> int:

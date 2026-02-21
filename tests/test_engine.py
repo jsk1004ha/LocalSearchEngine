@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from unittest.mock import patch
+import tempfile
+from pathlib import Path
 
 import sys
 import types
@@ -316,3 +318,79 @@ def test_web_fallback_respects_dsl_source_exclusion() -> None:
     assert result.evidence == []
     assert result.diagnostics["web_fallback"]["used"] is False
     assert result.diagnostics["web_fallback"]["reason"] == "filtered_out_by_query_dsl"
+
+
+def test_sniper_mode_returns_single_evidence() -> None:
+    engine = InvestigationEngine(_sample_units(), enable_cache=False, online_learning=False)
+    result = engine.search("처리 속도 개선", top_k_per_pass=5, time_budget_sec=120, mode="sniper")
+    assert len(result.evidence) == 1
+
+
+def test_knowledge_library_persists_sessions() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        class StubWebProvider:
+            provider_name = "duckduckgo-stub"
+
+            def search(self, query, *, max_results=5):
+                return [
+                    WebSearchResult(
+                        title="외부 검색 제목",
+                        url="https://example.com/a",
+                        snippet="외부 검색 스니펫",
+                        rank=1,
+                        provider=self.provider_name,
+                    )
+                ]
+
+        lib_dir = Path(td) / "library"
+        engine = InvestigationEngine(
+            _sample_units(),
+            enable_cache=False,
+            online_learning=False,
+            enable_knowledge_library=True,
+            knowledge_library_dir=lib_dir,
+            web_search_provider=StubWebProvider(),
+        )
+        result = engine.search("처리 속도 개선", top_k_per_pass=2, time_budget_sec=120, mode="reporter")
+        session_id = result.diagnostics.get("knowledge_library_session_id")
+        assert session_id
+        assert (lib_dir / "sessions" / f"{session_id}.json").exists()
+        assert (lib_dir / "evidence" / "web_snippets.jsonl").exists()
+
+
+def test_fbi_mode_emits_osint_graph_and_timeline() -> None:
+    class StubWebProvider:
+        provider_name = "duckduckgo-stub"
+
+        def search(self, query, *, max_results=5):
+            return [
+                WebSearchResult(
+                    title="Incident report 2024-01-02",
+                    url="https://example.com/a",
+                    snippet="Update on 2024-01-03 with details",
+                    rank=1,
+                    provider=self.provider_name,
+                ),
+                WebSearchResult(
+                    title="Follow-up",
+                    url="https://sub.example.com/b",
+                    snippet="No explicit date here",
+                    rank=2,
+                    provider=self.provider_name,
+                ),
+            ]
+
+    engine = InvestigationEngine(
+        _sample_units(),
+        enable_cache=False,
+        online_learning=False,
+        web_search_provider=StubWebProvider(),
+        enable_web_fallback=True,
+    )
+    result = engine.search("zzzxxyyqq", mode="fbi")
+    osint = result.diagnostics.get("osint")
+    assert isinstance(osint, dict)
+    assert "graph" in osint
+    assert "timeline" in osint
+    assert osint["graph"]["node_count"] >= 3
+    assert osint["timeline"][0]["date"] == "2024-01-02"
