@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 class SourceType(str, Enum):
@@ -37,6 +37,7 @@ class ScoredEvidence:
     score: float
     verdict: Verdict
     why_it_matches: str
+    stage_scores: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -44,5 +45,7 @@ class SearchResult:
     answer: str
     evidence: List[ScoredEvidence]
     contradictions: List[ScoredEvidence]
-    diagnostics: Dict[str, str]
+    diagnostics: Dict[str, Any]
+    reranker_model: Optional[str] = None
+    reranker_version: Optional[str] = None
     build_id: Optional[str] = None
