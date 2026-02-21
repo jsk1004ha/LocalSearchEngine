@@ -22,6 +22,9 @@
   - Pass C: 경계조건(대상/시점/조건 변경)
 - **진단 정보(Diagnostics)**
   - 각 pass hit 수, 실행 시간, time budget, 반례 근거 부족 여부 표기
+- **엔터티 정규화/집계**
+  - 이름/닉네임/아이디/메일 마스킹 표기를 정규화하고 alias 후보를 query expansion에 반영
+  - alias 확장 점수 페널티로 오탐을 제어하고 evidence metadata의 `canonical_entity_id` 기준 그룹 집계 지원
 
 ## 의존성
 

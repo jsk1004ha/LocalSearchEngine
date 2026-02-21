@@ -22,7 +22,7 @@ class EvidenceUnit:
     char_end: int
     timestamp: str
     confidence: float
-    metadata: Dict[str, str] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class Verdict(str, Enum):

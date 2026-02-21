@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections import defaultdict
 from typing import Dict, Iterable, List, Optional
 
 from .embedding import DEFAULT_EMBEDDING_MODEL
@@ -96,6 +97,7 @@ class InvestigationEngine:
             pass_stats["disconfirming_check"] = "insufficient_contradicting_evidence"
 
         pass_stats["rerank"] = rerank_meta
+        pass_stats["entity_groups"] = self._group_by_entity(best)
         pass_stats["elapsed_sec"] = f"{time.time() - start:.3f}"
         pass_stats["time_budget_sec"] = str(time_budget_sec)
 
@@ -141,3 +143,22 @@ class InvestigationEngine:
                 )
             )
         return reranked
+
+
+    def _group_by_entity(self, evidence_items: List[ScoredEvidence]) -> Dict[str, object]:
+        grouped: dict[str, list[ScoredEvidence]] = defaultdict(list)
+        for item in evidence_items:
+            canonical_id = item.evidence.metadata.get("canonical_entity_id")
+            if canonical_id is None:
+                grouped["null"].append(item)
+            else:
+                grouped[str(canonical_id)].append(item)
+
+        return {
+            key: {
+                "count": len(items),
+                "top_score": max(e.score for e in items),
+                "doc_ids": sorted({e.evidence.doc_id for e in items}),
+            }
+            for key, items in grouped.items()
+        }

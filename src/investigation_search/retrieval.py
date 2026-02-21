@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Iterable, List, Sequence
 
 from .embedding import DEFAULT_EMBEDDING_MODEL, encode_texts
+from .entity import expansion_factor, generate_alias_candidates
 from .index_ann import ANNIndex, search_index
 from .schema import EvidenceUnit, ScoredEvidence, Verdict
 
@@ -18,6 +19,13 @@ class QueryPass:
     query: str
 
 
+@dataclass(frozen=True)
+class ExpandedQuery:
+    query: str
+    penalty: float = 0.0
+    reason: str = "original"
+
+
 def tokenize(text: str) -> List[str]:
     return [m.group(0).lower() for m in _WORD_RE.finditer(text)]
 
@@ -28,6 +36,24 @@ def build_passes(query: str) -> Sequence[QueryPass]:
         QueryPass("pass_b_contradict", f"{query} 하지만 예외 제한 반대 근거"),
         QueryPass("pass_c_boundary", f"{query} 조건 시점 대상 변경"),
     )
+
+
+def expand_query_aliases(query: str, max_aliases: int = 5) -> List[ExpandedQuery]:
+    expansions: List[ExpandedQuery] = [ExpandedQuery(query=query)]
+    for candidate in generate_alias_candidates(query)[:max_aliases]:
+        alias = candidate.alias
+        if alias == query:
+            continue
+        factor = expansion_factor(query, alias)
+        adjusted_penalty = min(candidate.penalty + (1 - factor) * 0.15, 0.65)
+        expansions.append(
+            ExpandedQuery(
+                query=alias,
+                penalty=adjusted_penalty,
+                reason=f"alias:{candidate.reason}",
+            )
+        )
+    return expansions
 
 
 def lexical_score(query: str, text: str) -> float:
@@ -64,19 +90,31 @@ def retrieve(
 ) -> List[ScoredEvidence]:
     units = list(evidence_units)
     lexical_hits: List[ScoredEvidence] = []
-    for unit in units:
-        score = lexical_score(query_pass.query, unit.content)
-        if score <= 0:
-            continue
-        verdict = classify_verdict(query_pass.name, unit.content)
-        lexical_hits.append(
-            ScoredEvidence(
-                evidence=unit,
-                score=score,
-                verdict=verdict,
-                why_it_matches=f"{query_pass.name}: lexical 키워드 중첩 {score:.2f}",
+    expansions = expand_query_aliases(query_pass.query)
+
+    for expanded in expansions:
+        for unit in units:
+            base_score = lexical_score(expanded.query, unit.content)
+            if base_score <= 0:
+                continue
+            final_score = base_score * (1 - expanded.penalty)
+            verdict = classify_verdict(query_pass.name, unit.content)
+            lexical_hits.append(
+                ScoredEvidence(
+                    evidence=unit,
+                    score=final_score,
+                    verdict=verdict,
+                    why_it_matches=(
+                        f"{query_pass.name}: lexical({expanded.reason})={base_score:.2f}, "
+                        f"penalty={expanded.penalty:.2f}"
+                    ),
+                    stage_scores={
+                        "lexical": base_score,
+                        "alias_penalty": expanded.penalty,
+                        "expanded_final": final_score,
+                    },
+                )
             )
-        )
 
     lexical_hits.sort(key=lambda s: s.score, reverse=True)
     candidate_pool = lexical_hits[: top_k * 3]
@@ -94,6 +132,7 @@ def retrieve(
                     score=dense_score,
                     verdict=classify_verdict(query_pass.name, unit.content),
                     why_it_matches=f"{query_pass.name}: dense 유사도 {dense_score:.2f}",
+                    stage_scores={"dense": dense_score},
                 )
             )
 
@@ -110,6 +149,7 @@ def retrieve(
                 score=hit.score,
                 verdict=hit.verdict,
                 why_it_matches=f"{prev.why_it_matches} + {hit.why_it_matches}",
+                stage_scores={**prev.stage_scores, **hit.stage_scores},
             )
         else:
             merged[key] = ScoredEvidence(
@@ -117,6 +157,7 @@ def retrieve(
                 score=prev.score,
                 verdict=prev.verdict,
                 why_it_matches=f"{prev.why_it_matches} + {hit.why_it_matches}",
+                stage_scores={**prev.stage_scores, **hit.stage_scores},
             )
 
     scored = sorted(merged.values(), key=lambda s: s.score, reverse=True)
