@@ -3,14 +3,25 @@ from __future__ import annotations
 import time
 from typing import Dict, Iterable, List, Optional
 
+from .embedding import DEFAULT_EMBEDDING_MODEL
+from .index_ann import ANNIndex
 from .retrieval import build_passes, retrieve
 from .schema import EvidenceUnit, ScoredEvidence, SearchResult, Verdict
 
 
 class InvestigationEngine:
-    def __init__(self, evidence_units: Iterable[EvidenceUnit], build_id: Optional[str] = None):
+    def __init__(
+        self,
+        evidence_units: Iterable[EvidenceUnit],
+        build_id: Optional[str] = None,
+        *,
+        ann_index: ANNIndex | None = None,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    ):
         self.evidence_units = list(evidence_units)
         self.build_id = build_id
+        self.ann_index = ann_index
+        self.embedding_model = embedding_model
 
     def search(
         self,
@@ -29,7 +40,13 @@ class InvestigationEngine:
                 pass_stats[qp.name] = "skipped_time_budget"
                 continue
 
-            hits = retrieve(qp, self.evidence_units, top_k=top_k_per_pass)
+            hits = retrieve(
+                qp,
+                self.evidence_units,
+                top_k=top_k_per_pass,
+                ann_index=self.ann_index,
+                embedding_model=self.embedding_model,
+            )
             selected.extend(hits)
             pass_stats[qp.name] = f"{len(hits)} hits"
 
