@@ -9,6 +9,7 @@ from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
 
+from .bm25 import BM25Index, build_bm25_index, load_bm25_index, save_bm25_index
 from .embedding import DEFAULT_EMBEDDING_MODEL, encode_texts
 from .index_ann import ANNIndex, build_index, load_index, save_index
 from .parser import DocumentParser, parse_documents
@@ -118,6 +119,8 @@ def write_build(
 
     ann = build_index(vectors, backend=ann_backend)
     ann_index_path, ann_meta_path = save_index(ann, output_dir / "ann_index")
+    bm25 = build_bm25_index([u.content for u in units])
+    bm25_path = save_bm25_index(bm25, output_dir / "bm25_index.json")
 
     manifest = dict(manifest)
     manifest.setdefault("artifacts", {})
@@ -125,6 +128,7 @@ def write_build(
     manifest["artifacts"][embedding_path.name] = _file_hash(embedding_path)
     manifest["artifacts"][ann_index_path.name] = _file_hash(ann_index_path)
     manifest["artifacts"][ann_meta_path.name] = _file_hash(ann_meta_path)
+    manifest["artifacts"][bm25_path.name] = _file_hash(bm25_path)
     manifest["embedding_model"] = embedding_model
     manifest["ann_backend"] = ann.backend
     manifest["incremental"] = inc_stats
@@ -201,6 +205,25 @@ def load_sharded_build(input_dir: Path) -> list[tuple[list[EvidenceUnit], np.nda
         ann = load_index(ann_index_path, ann_meta_path)
         bundles.append((units, embeddings, ann))
     return bundles
+
+
+def load_bm25_from_build(input_dir: Path) -> BM25Index:
+    path = input_dir / "bm25_index.json"
+    return load_bm25_index(path)
+
+
+def load_sharded_bm25_indices(input_dir: Path) -> list[BM25Index]:
+    manifest_path = input_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    shard_meta = manifest.get("shards", [])
+    out: list[BM25Index] = []
+    for shard in shard_meta:
+        path = input_dir / shard["path"] / "bm25_index.json"
+        if not path.exists():
+            out.append(build_bm25_index([]))
+            continue
+        out.append(load_bm25_index(path))
+    return out
 
 
 def write_build_from_documents(
@@ -359,6 +382,10 @@ def _write_shards(
             shard_entry["ann_backend"] = ann.backend
             shard_entry["artifacts"][ann_index_path.name] = _file_hash(ann_index_path)
             shard_entry["artifacts"][ann_meta_path.name] = _file_hash(ann_meta_path)
+
+        bm25 = build_bm25_index([unit.content for unit in shard_units])
+        bm25_path = save_bm25_index(bm25, shard_dir / "bm25_index.json")
+        shard_entry["artifacts"][bm25_path.name] = _file_hash(bm25_path)
 
         entries.append(shard_entry)
 

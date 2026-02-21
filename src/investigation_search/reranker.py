@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, List, Protocol
 
+from .analyzer import unique_tokens
 from .schema import ScoredEvidence
 
 
@@ -56,4 +57,4 @@ class OnnxRerankerAdapter:
 
 
 def _tokenize(text: str) -> List[str]:
-    return [tok.lower() for tok in text.split() if tok]
+    return list(unique_tokens(text, mode="rerank", include_char_ngrams=True))

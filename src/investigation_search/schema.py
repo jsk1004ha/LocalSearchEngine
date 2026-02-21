@@ -10,6 +10,7 @@ class SourceType(str, Enum):
     TABLE_CELL = "table_cell"
     CAPTION = "caption"
     OCR_TEXT = "ocr_text"
+    WEB_SNIPPET = "web_snippet"
 
 
 @dataclass(frozen=True)

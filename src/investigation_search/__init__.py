@@ -1,13 +1,16 @@
-from .bm25 import BM25Index, build_bm25_index, search_bm25
+from .analyzer import detect_language, tokenize, unique_tokens
+from .bm25 import BM25Index, build_bm25_index, load_bm25_index, save_bm25_index, search_bm25
 from .contradiction import (
     ContradictionDetector,
     ContradictionPrediction,
     HeuristicContradictionDetector,
     OnnxContradictionDetectorAdapter,
 )
+from .dsl import ParsedSearchQuery, SearchFilters, apply_search_filters, filter_to_dict, parse_search_query
 from .embedding import DEFAULT_EMBEDDING_MODEL, encode_texts, load_local_model
 from .engine import InvestigationEngine
 from .entity import AliasCandidate, generate_alias_candidates, normalize_masked_entity
+from .evaluation import EvaluationCase, EvaluationReport, compare_reports, evaluate_engine
 from .index_ann import build_index, load_index, save_index, search_index
 from .learning import LearningConfig, LearningState, OnlineLearningManager
 from .ollama import OllamaClient, OllamaContradictionDetector, OllamaRerankerAdapter
@@ -16,12 +19,14 @@ from .reranker import LocalCrossEncoderReranker, OnnxRerankerAdapter
 from .offline import (
     build_manifest,
     knowledge_build_id,
+    load_bm25_from_build,
     load_build,
+    load_sharded_bm25_indices,
     load_sharded_build,
     write_build,
     write_build_from_documents,
 )
-from .retrieval import RetrievalWeights, build_bm25_for_units
+from .retrieval import RetrievalOptions, RetrievalWeights, build_bm25_for_units
 from .schema import (
     EvidenceUnit,
     ScoredEvidence,
@@ -31,14 +36,27 @@ from .schema import (
     Verdict,
     build_source_citation,
 )
+from .viewer import highlight_text, render_result_text, summarize_stage_scores
+from .websearch import DuckDuckGoSearchProvider, WebSearchProvider, WebSearchResult
 
 __all__ = [
     "InvestigationEngine",
+    "ParsedSearchQuery",
+    "SearchFilters",
+    "parse_search_query",
+    "apply_search_filters",
+    "filter_to_dict",
+    "detect_language",
+    "tokenize",
+    "unique_tokens",
     "BM25Index",
     "build_bm25_index",
+    "save_bm25_index",
+    "load_bm25_index",
     "search_bm25",
     "build_bm25_for_units",
     "RetrievalWeights",
+    "RetrievalOptions",
     "ContradictionDetector",
     "ContradictionPrediction",
     "HeuristicContradictionDetector",
@@ -49,6 +67,10 @@ __all__ = [
     "LearningConfig",
     "LearningState",
     "OnlineLearningManager",
+    "EvaluationCase",
+    "EvaluationReport",
+    "evaluate_engine",
+    "compare_reports",
     "OllamaClient",
     "OllamaRerankerAdapter",
     "OllamaContradictionDetector",
@@ -60,6 +82,8 @@ __all__ = [
     "write_build",
     "write_build_from_documents",
     "load_build",
+    "load_bm25_from_build",
+    "load_sharded_bm25_indices",
     "load_sharded_build",
     "build_index",
     "search_index",
@@ -75,6 +99,12 @@ __all__ = [
     "SearchResult",
     "SourceCitation",
     "build_source_citation",
+    "highlight_text",
+    "render_result_text",
+    "summarize_stage_scores",
+    "WebSearchProvider",
+    "WebSearchResult",
+    "DuckDuckGoSearchProvider",
     "SourceType",
     "Verdict",
 ]

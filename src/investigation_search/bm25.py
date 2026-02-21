@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import math
-import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
+import json
 
-_WORD_RE = re.compile(r"[a-zA-Z0-9가-힣]+")
-
+from .analyzer import tokenize as analyze_tokens
 
 def tokenize(text: str) -> List[str]:
-    return [m.group(0).lower() for m in _WORD_RE.finditer(text)]
+    return analyze_tokens(text, mode="bm25", include_char_ngrams=True)
 
 
 @dataclass(frozen=True)
@@ -92,3 +92,36 @@ def search_bm25(
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return ranked[:top_k]
+
+
+def save_bm25_index(index: BM25Index, path: str | Path) -> Path:
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "postings": {term: [[doc_id, tf] for doc_id, tf in rows] for term, rows in index.postings.items()},
+        "doc_len": index.doc_len,
+        "doc_count": index.doc_count,
+        "avg_doc_len": index.avg_doc_len,
+        "k1": index.k1,
+        "b": index.b,
+    }
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    return out_path
+
+
+def load_bm25_index(path: str | Path) -> BM25Index:
+    src = Path(path)
+    payload = json.loads(src.read_text(encoding="utf-8"))
+    postings_payload = payload.get("postings", {})
+    postings = {
+        str(term): [(int(row[0]), int(row[1])) for row in rows]
+        for term, rows in postings_payload.items()
+    }
+    return BM25Index(
+        postings=postings,
+        doc_len=[int(v) for v in payload.get("doc_len", [])],
+        doc_count=int(payload.get("doc_count", 0)),
+        avg_doc_len=float(payload.get("avg_doc_len", 0.0)),
+        k1=float(payload.get("k1", 1.5)),
+        b=float(payload.get("b", 0.75)),
+    )

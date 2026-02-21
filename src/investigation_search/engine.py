@@ -5,16 +5,27 @@ import time
 from collections import defaultdict
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence
 
 from .bm25 import BM25Index
 from .contradiction import ContradictionDetector, HeuristicContradictionDetector
+from .dsl import ParsedSearchQuery, SearchFilters, apply_search_filters, filter_to_dict, parse_search_query
 from .embedding import DEFAULT_EMBEDDING_MODEL
 from .index_ann import ANNIndex
 from .learning import LearningConfig, OnlineLearningManager
 from .reranker import LocalCrossEncoderReranker, Reranker
-from .retrieval import QueryPass, RetrievalWeights, build_bm25_for_units, build_passes, retrieve
-from .schema import EvidenceUnit, ScoredEvidence, SearchResult, SourceCitation, Verdict, build_source_citation
+from .retrieval import (
+    QueryPass,
+    RetrievalOptions,
+    RetrievalWeights,
+    build_bm25_for_units,
+    build_passes,
+    retrieve,
+)
+from .schema import EvidenceUnit, ScoredEvidence, SearchResult, SourceCitation, SourceType, Verdict, build_source_citation
+from .viewer import summarize_stage_scores
+from .websearch import DuckDuckGoSearchProvider, WebSearchProvider
 
 
 @dataclass(frozen=True)
@@ -53,6 +64,13 @@ class InvestigationEngine:
         learning_state_path: str | None = None,
         learning_rate: float = 0.08,
         learning_autosave_every: int = 20,
+        retrieval_options: RetrievalOptions | None = None,
+        max_rerank_candidates: int = 32,
+        enable_search_dsl: bool = True,
+        enable_web_fallback: bool = True,
+        web_fallback_min_local_hits: int = 1,
+        web_max_results: int = 3,
+        web_search_provider: WebSearchProvider | None = None,
     ):
         self.evidence_units = list(evidence_units)
         self.build_id = build_id
@@ -61,9 +79,16 @@ class InvestigationEngine:
         self.reranker = reranker or LocalCrossEncoderReranker()
         self.contradiction_detector = contradiction_detector or HeuristicContradictionDetector()
         self.retrieval_weights = retrieval_weights or RetrievalWeights()
+        self.retrieval_options = retrieval_options or RetrievalOptions()
         self.enable_cache = enable_cache
         self.cache_size = max(0, cache_size)
         self.cache_ttl_sec = max(0.0, cache_ttl_sec)
+        self.max_rerank_candidates = max(1, int(max_rerank_candidates))
+        self.enable_search_dsl = bool(enable_search_dsl)
+        self.enable_web_fallback = bool(enable_web_fallback)
+        self.web_fallback_min_local_hits = max(0, int(web_fallback_min_local_hits))
+        self.web_max_results = max(1, int(web_max_results))
+        self.web_search_provider = web_search_provider or DuckDuckGoSearchProvider()
         self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
         self._learner = OnlineLearningManager(
             self.retrieval_weights,
@@ -114,6 +139,16 @@ class InvestigationEngine:
         pass_stats["online_learning"] = self._learner.snapshot()
         active_weights = self._learner.current_weights()
         active_token_boosts = self._learner.current_token_boosts()
+
+        parsed_query = self._parse_query(query)
+        query_text = parsed_query.clean_query
+        pass_stats["query_dsl"] = {
+            "enabled": self.enable_search_dsl,
+            "raw_query": parsed_query.raw_query,
+            "clean_query": parsed_query.clean_query,
+            "filters": filter_to_dict(parsed_query.filters),
+            "phrase_terms": list(parsed_query.phrase_terms),
+        }
         pass_stats["retrieval_weights"] = {
             "bm25": active_weights.bm25,
             "dense": active_weights.dense,
@@ -121,7 +156,7 @@ class InvestigationEngine:
             "rrf": active_weights.rrf,
         }
 
-        for qp in build_passes(query):
+        for qp in build_passes(query_text):
             elapsed = time.time() - start
             remaining = time_budget_sec - elapsed
             if remaining <= 0:
@@ -134,6 +169,9 @@ class InvestigationEngine:
                 top_k=top_k_per_pass,
                 weights=active_weights,
                 token_boosts=active_token_boosts,
+                time_budget_sec=time_budget_sec,
+                elapsed_sec=elapsed,
+                filters=parsed_query.filters,
             )
             selected.extend(hits)
             pass_stats[qp.name] = {"hits": len(hits), "shards": shard_hits}
@@ -163,8 +201,12 @@ class InvestigationEngine:
                 rerank_meta["reason"] = "time_budget_exceeded"
                 reranked = self._annotate_initial_scores(selected)
             else:
-                reranked = self._rerank(query, selected)
+                reranked = self._rerank(query_text, selected)
                 rerank_meta["reason"] = "applied"
+                rerank_meta["applied_count"] = int(
+                    sum(1 for item in reranked if item.stage_scores.get("rerank_applied", 0.0) >= 0.5)
+                )
+                rerank_meta["max_rerank_candidates"] = self.max_rerank_candidates
 
         detector_meta = {
             "model": self.contradiction_detector.model_name,
@@ -172,7 +214,7 @@ class InvestigationEngine:
             "overrides": 0,
         }
         if reranked:
-            reranked, detector_meta = self._apply_contradiction_detector(query, reranked, detector_meta)
+            reranked, detector_meta = self._apply_contradiction_detector(query_text, reranked, detector_meta)
 
         reranked.sort(key=lambda s: s.score, reverse=True)
         best = reranked[: max(top_k_per_pass, 3)]
@@ -193,6 +235,33 @@ class InvestigationEngine:
         if not contradictions and best:
             pass_stats["disconfirming_check"] = "insufficient_contradicting_evidence"
 
+        web_meta: dict[str, object] = {
+            "enabled": self.enable_web_fallback,
+            "provider": getattr(self.web_search_provider, "provider_name", None),
+            "used": False,
+            "reason": None,
+            "result_count": 0,
+        }
+        if self.enable_web_fallback and len(best) < self.web_fallback_min_local_hits:
+            if self._web_allowed_by_filters(parsed_query.filters):
+                web_hits, web_meta = self._web_fallback(query_text, web_meta=web_meta)
+                if web_hits:
+                    best = self._merge_with_web(best, web_hits, top_n=max(top_k_per_pass, 3))
+                    contradictions = [s for s in best if s.verdict == Verdict.CONTRADICTS]
+                    supports = [s for s in best if s.verdict == Verdict.SUPPORTS]
+                    if supports:
+                        answer = supports[0].evidence.content
+                        answer_source = supports[0].source or build_source_citation(supports[0].evidence)
+                    elif best:
+                        answer = best[0].evidence.content
+                        answer_source = best[0].source or build_source_citation(best[0].evidence)
+            else:
+                web_meta["reason"] = "filtered_out_by_query_dsl"
+        elif self.enable_web_fallback:
+            web_meta["reason"] = "enough_local_hits"
+        else:
+            web_meta["reason"] = "disabled"
+
         sources = self._collect_sources(best)
         if answer_source is not None:
             pass_stats["answer_source"] = answer_source.citation_id
@@ -201,6 +270,7 @@ class InvestigationEngine:
         end_ts = time.time()
         pass_stats["rerank"] = rerank_meta
         pass_stats["contradiction_detector"] = detector_meta
+        pass_stats["web_fallback"] = web_meta
         pass_stats["entity_groups"] = self._group_by_entity(best)
         pass_stats["elapsed_sec"] = f"{end_ts - start:.3f}"
         pass_stats["time_budget_sec"] = str(time_budget_sec)
@@ -216,7 +286,7 @@ class InvestigationEngine:
             answer_sources=[answer_source] if answer_source is not None else [],
             sources=sources,
         )
-        pass_stats["online_learning"] = self._learner.learn(query, best)
+        pass_stats["online_learning"] = self._learner.learn(query_text, best)
         self._cache_put(cache_key, result, created_at=end_ts)
         return result
 
@@ -227,27 +297,43 @@ class InvestigationEngine:
                 score=candidate.score,
                 verdict=candidate.verdict,
                 why_it_matches=candidate.why_it_matches,
-                stage_scores={**candidate.stage_scores, "first_pass": candidate.score},
+                stage_scores={**candidate.stage_scores, "first_pass": candidate.score, "rerank_applied": 0.0},
                 source=candidate.source or build_source_citation(candidate.evidence),
             )
             for candidate in candidates
         ]
 
     def _rerank(self, query: str, candidates: List[ScoredEvidence]) -> List[ScoredEvidence]:
-        rerank_scores = self.reranker.score(query, candidates)
+        if len(candidates) <= self.max_rerank_candidates:
+            rerank_indices = list(range(len(candidates)))
+        else:
+            ranked_by_score = sorted(range(len(candidates)), key=lambda idx: candidates[idx].score, reverse=True)
+            rerank_indices = ranked_by_score[: self.max_rerank_candidates]
+
+        rerank_subset = [candidates[idx] for idx in rerank_indices]
+        rerank_scores = self.reranker.score(query, rerank_subset)
+        rerank_map = {idx: score for idx, score in zip(rerank_indices, rerank_scores)}
+
         reranked: List[ScoredEvidence] = []
-        for candidate, rerank_score in zip(candidates, rerank_scores):
+        for idx, candidate in enumerate(candidates):
+            rerank_score = rerank_map.get(idx, candidate.score)
+            rerank_applied = idx in rerank_map
             final_score = candidate.score * 0.35 + rerank_score * 0.65
             reranked.append(
                 ScoredEvidence(
                     evidence=candidate.evidence,
                     score=final_score,
                     verdict=candidate.verdict,
-                    why_it_matches=f"{candidate.why_it_matches} + rerank {rerank_score:.3f}",
+                    why_it_matches=(
+                        f"{candidate.why_it_matches} + rerank {rerank_score:.3f}"
+                        if rerank_applied
+                        else f"{candidate.why_it_matches} + rerank_skipped"
+                    ),
                     stage_scores={
                         **candidate.stage_scores,
                         "first_pass": candidate.score,
-                        "rerank": rerank_score,
+                        "rerank": rerank_score if rerank_applied else 0.0,
+                        "rerank_applied": 1.0 if rerank_applied else 0.0,
                         "final": final_score,
                     },
                     source=candidate.source or build_source_citation(candidate.evidence),
@@ -281,23 +367,36 @@ class InvestigationEngine:
         top_k: int,
         weights: RetrievalWeights,
         token_boosts: Dict[str, float],
+        time_budget_sec: int,
+        elapsed_sec: float,
+        filters: SearchFilters,
     ) -> tuple[List[ScoredEvidence], Dict[str, int]]:
         shard_hits: dict[str, int] = {}
         all_hits: list[ScoredEvidence] = []
+        budget_ratio = 1.0
+        if time_budget_sec > 0:
+            budget_ratio = max(0.05, min(1.0, (time_budget_sec - elapsed_sec) / time_budget_sec))
+        dense_factor = 6 if budget_ratio >= 0.45 else 4
+        candidate_factor = 8 if budget_ratio >= 0.45 else 5
 
         for shard in self._shards:
-            if not shard.units:
+            filtered_units = apply_search_filters(shard.units, filters)
+            if not filtered_units:
                 shard_hits[str(shard.shard_id)] = 0
                 continue
+            can_reuse_shard_indexes = len(filtered_units) == len(shard.units)
             hits = retrieve(
                 query_pass=QueryPass(name=pass_name, query=query),
-                evidence_units=shard.units,
+                evidence_units=filtered_units,
                 top_k=max(top_k, 2),
-                bm25_index=shard.bm25_index,
-                ann_index=shard.ann_index,
+                bm25_index=shard.bm25_index if can_reuse_shard_indexes else None,
+                ann_index=shard.ann_index if can_reuse_shard_indexes else None,
                 embedding_model=self.embedding_model,
                 weights=weights,
                 token_boosts=token_boosts,
+                options=self.retrieval_options,
+                dense_top_k_factor=dense_factor,
+                candidate_limit_factor=candidate_factor,
             )
             all_hits.extend(hits)
             shard_hits[str(shard.shard_id)] = len(hits)
@@ -420,7 +519,7 @@ class InvestigationEngine:
         payload = (
             f"{self.build_id}|{self.embedding_model}|{self.shard_count}|"
             f"{top_k_per_pass}|{time_budget_sec}|{len(self.evidence_units)}|"
-            f"{learning_bucket}|{query.strip().lower()}"
+            f"{learning_bucket}|{int(self.enable_web_fallback)}|{query.strip().lower()}"
         )
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
@@ -485,6 +584,129 @@ class InvestigationEngine:
 
     def save_learning_state(self, path: str | None = None) -> None:
         self._learner.save(path)
+
+    def clear_cache(self) -> None:
+        self._cache.clear()
+
+    def delete_user_search_data(self, *, delete_learning_state_file: bool = True) -> Dict[str, object]:
+        cache_size = len(self._cache)
+        self._cache.clear()
+        self._learner.clear(delete_state_file=delete_learning_state_file)
+        return {
+            "cache_entries_deleted": cache_size,
+            "learning_state_reset": True,
+            "learning_state_file_deleted": bool(delete_learning_state_file),
+        }
+
+    def explain(self, result: SearchResult, *, max_items: int = 5) -> Dict[str, object]:
+        items = list(result.evidence[: max(max_items, 0)])
+        evidence = []
+        for item in items:
+            source = item.source or build_source_citation(item.evidence)
+            evidence.append(
+                {
+                    "citation_id": source.citation_id,
+                    "doc_id": source.doc_id,
+                    "section_path": source.section_path,
+                    "source_type": source.source_type.value,
+                    "verdict": item.verdict.value,
+                    "score": item.score,
+                    "why": item.why_it_matches,
+                    "stage_scores": dict(item.stage_scores),
+                }
+            )
+
+        return {
+            "answer": result.answer,
+            "answer_sources": [s.citation_id for s in result.answer_sources],
+            "source_count": len(result.sources),
+            "evidence": evidence,
+            "stage_score_summary": summarize_stage_scores(items),
+            "diagnostics": dict(result.diagnostics),
+        }
+
+    def _parse_query(self, query: str) -> ParsedSearchQuery:
+        if not self.enable_search_dsl:
+            return ParsedSearchQuery(
+                raw_query=query,
+                clean_query=query.strip(),
+                filters=SearchFilters(),
+                phrase_terms=[],
+                free_terms=[query.strip()] if query.strip() else [],
+            )
+        return parse_search_query(query)
+
+    def _web_allowed_by_filters(self, filters: SearchFilters) -> bool:
+        if filters.include_source_types and SourceType.WEB_SNIPPET not in filters.include_source_types:
+            return False
+        if SourceType.WEB_SNIPPET in filters.exclude_source_types:
+            return False
+        return True
+
+    def _web_fallback(
+        self,
+        query: str,
+        *,
+        web_meta: Dict[str, object],
+    ) -> tuple[List[ScoredEvidence], Dict[str, object]]:
+        provider = self.web_search_provider
+        try:
+            rows = provider.search(query, max_results=self.web_max_results)
+        except Exception as exc:
+            updated = dict(web_meta)
+            updated["reason"] = f"error:{type(exc).__name__}"
+            return [], updated
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        hits: list[ScoredEvidence] = []
+        for rank, row in enumerate(rows, start=1):
+            content = row.snippet.strip() or row.title.strip()
+            if not content:
+                continue
+            unit = EvidenceUnit(
+                doc_id=row.url,
+                source_type=SourceType.WEB_SNIPPET,
+                content=content,
+                section_path=row.title.strip()[:120] or "web",
+                char_start=0,
+                char_end=len(content),
+                timestamp=now_iso,
+                confidence=0.62,
+                metadata={
+                    "provider": row.provider,
+                    "url": row.url,
+                    "title": row.title,
+                    "web_rank": rank,
+                },
+            )
+            score = max(0.0, 1.0 - (rank - 1) * 0.12)
+            hits.append(
+                ScoredEvidence(
+                    evidence=unit,
+                    score=score,
+                    verdict=Verdict.UNCERTAIN,
+                    why_it_matches=f"web_fallback:{row.provider}:rank={rank}",
+                    stage_scores={"web_fallback": score, "web_rank": float(rank)},
+                    source=build_source_citation(unit),
+                )
+            )
+
+        updated = dict(web_meta)
+        updated["used"] = bool(hits)
+        updated["result_count"] = len(hits)
+        updated["reason"] = "applied" if hits else "no_results"
+        return hits, updated
+
+    def _merge_with_web(
+        self,
+        local_hits: Sequence[ScoredEvidence],
+        web_hits: Sequence[ScoredEvidence],
+        *,
+        top_n: int,
+    ) -> List[ScoredEvidence]:
+        merged = list(local_hits) + list(web_hits)
+        merged.sort(key=lambda item: item.score, reverse=True)
+        return self._dedupe_candidates(merged)[: max(top_n, 1)]
 
     @staticmethod
     def _shard_for_doc(doc_id: str, shard_count: int) -> int:

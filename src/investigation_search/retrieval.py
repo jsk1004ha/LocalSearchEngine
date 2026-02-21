@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Mapping, Sequence
 
+from .analyzer import detect_language, unique_tokens
 from .bm25 import BM25Index, build_bm25_index, search_bm25
 from .embedding import DEFAULT_EMBEDDING_MODEL, encode_texts
 from .entity import expansion_factor, generate_alias_candidates
 from .index_ann import ANNIndex, search_index
-from .schema import EvidenceUnit, ScoredEvidence, Verdict, build_source_citation
-
-
-_WORD_RE = re.compile(r"[a-zA-Z0-9가-힣]+")
+from .schema import EvidenceUnit, ScoredEvidence, SourceType, Verdict, build_source_citation
 
 
 @dataclass(frozen=True)
@@ -36,15 +34,46 @@ class RetrievalWeights:
     rrf_k: int = 60
 
 
-def tokenize(text: str) -> List[str]:
-    return [m.group(0).lower() for m in _WORD_RE.finditer(text)]
+@dataclass(frozen=True)
+class RetrievalOptions:
+    use_morphology: bool = False
+    include_char_ngrams: bool = True
+    min_ocr_confidence: float = 0.35
+    short_table_cell_len: int = 4
+    short_table_penalty: float = 0.88
+    enable_recency_boost: bool = False
+    recency_half_life_days: float = 30.0
+    max_recency_boost: float = 0.12
+    now_utc: datetime | None = None
+
+
+def tokenize(text: str, *, use_morphology: bool = False, include_char_ngrams: bool = True) -> List[str]:
+    return sorted(
+        unique_tokens(
+            text,
+            mode="search",
+            use_morphology=use_morphology,
+            include_char_ngrams=include_char_ngrams,
+        )
+    )
 
 
 def build_passes(query: str) -> Sequence[QueryPass]:
+    lang = detect_language(query)
+    if lang == "en":
+        contradict_hint = "however exception limitation counter evidence unless not"
+        boundary_hint = "condition timeline scope boundary edge case only if"
+    elif lang == "mixed":
+        contradict_hint = "하지만 예외 제한 반대 근거 however exception limitation"
+        boundary_hint = "조건 시점 대상 변경 condition timeline scope"
+    else:
+        contradict_hint = "하지만 예외 제한 반대 근거 단 only if unless limitation"
+        boundary_hint = "조건 시점 대상 변경 경계 사례 edge case boundary"
+
     return (
         QueryPass("pass_a_support", query),
-        QueryPass("pass_b_contradict", f"{query} 하지만 예외 제한 반대 근거"),
-        QueryPass("pass_c_boundary", f"{query} 조건 시점 대상 변경"),
+        QueryPass("pass_b_contradict", f"{query} {contradict_hint}"),
+        QueryPass("pass_c_boundary", f"{query} {boundary_hint}"),
     )
 
 
@@ -71,9 +100,23 @@ def lexical_score(
     text: str,
     *,
     token_boosts: Mapping[str, float] | None = None,
+    options: RetrievalOptions | None = None,
 ) -> float:
-    q = set(tokenize(query))
-    t = set(tokenize(text))
+    options = options or RetrievalOptions()
+    q = set(
+        tokenize(
+            query,
+            use_morphology=options.use_morphology,
+            include_char_ngrams=options.include_char_ngrams,
+        )
+    )
+    t = set(
+        tokenize(
+            text,
+            use_morphology=options.use_morphology,
+            include_char_ngrams=options.include_char_ngrams,
+        )
+    )
     if not q or not t:
         return 0.0
     inter_tokens = q & t
@@ -148,6 +191,9 @@ def retrieve(
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     weights: RetrievalWeights | None = None,
     token_boosts: Mapping[str, float] | None = None,
+    options: RetrievalOptions | None = None,
+    dense_top_k_factor: int = 6,
+    candidate_limit_factor: int = 8,
 ) -> List[ScoredEvidence]:
     units = list(evidence_units)
     if not units or top_k <= 0:
@@ -155,13 +201,19 @@ def retrieve(
 
     unit_by_key = {_span_key(unit): unit for unit in units}
     weights = weights or RetrievalWeights()
+    options = options or RetrievalOptions()
     expansions = expand_query_aliases(query_pass.query)
 
     lexical_scores: dict[tuple[str, int, int], float] = {}
     lexical_penalty: dict[tuple[str, int, int], float] = {}
     for expanded in expansions:
         for unit in units:
-            base_score = lexical_score(expanded.query, unit.content, token_boosts=token_boosts)
+            base_score = lexical_score(
+                expanded.query,
+                unit.content,
+                token_boosts=token_boosts,
+                options=options,
+            )
             if base_score <= 0:
                 continue
             final_score = base_score * (1 - expanded.penalty)
@@ -175,7 +227,7 @@ def retrieve(
 
     bm25_scores: dict[tuple[str, int, int], float] = {}
     bm25_penalty: dict[tuple[str, int, int], float] = {}
-    bm25_limit = max(top_k * 6, 12)
+    bm25_limit = max(top_k * max(dense_top_k_factor, 1), 12)
     for expanded in expansions:
         bm25_rows = search_bm25(
             bm25_index,
@@ -195,13 +247,13 @@ def retrieve(
     dense_scores: dict[tuple[str, int, int], float] = {}
     if ann_index is not None:
         query_vec = encode_texts([query_pass.query], model_name=embedding_model, text_type="query")
-        for doc_ix, dense_score in search_index(ann_index, query_vec, top_k=top_k * 6)[0]:
+        for doc_ix, dense_score in search_index(ann_index, query_vec, top_k=top_k * max(dense_top_k_factor, 1))[0]:
             if doc_ix < 0 or doc_ix >= len(units):
                 continue
             unit = units[doc_ix]
             dense_scores[_span_key(unit)] = float(dense_score)
 
-    candidate_limit = max(top_k * 8, 20)
+    candidate_limit = max(top_k * max(candidate_limit_factor, 1), 20)
     candidate_keys = (
         _top_keys(bm25_scores, limit=candidate_limit)
         | _top_keys(dense_scores, limit=candidate_limit)
@@ -234,6 +286,10 @@ def retrieve(
             + weights.lexical * lexical_norm.get(key, 0.0)
             + weights.rrf * rrf_score
         )
+        quality_prior = _quality_prior(unit, options=options)
+        final_score *= quality_prior
+        if final_score <= 0:
+            continue
 
         why_parts = [f"{query_pass.name}: hybrid"]
         if key in bm25_scores:
@@ -248,6 +304,7 @@ def retrieve(
             "dense": dense_scores.get(key, 0.0),
             "lexical": lexical_scores.get(key, 0.0),
             "rrf": rrf_score,
+            "quality_prior": quality_prior,
             "hybrid": final_score,
         }
         if key in bm25_penalty:
@@ -268,3 +325,43 @@ def retrieve(
 
     scored.sort(key=lambda s: s.score, reverse=True)
     return scored[:top_k]
+
+
+def _quality_prior(unit: EvidenceUnit, *, options: RetrievalOptions) -> float:
+    confidence = max(0.0, min(float(unit.confidence), 1.0))
+    prior = confidence**0.7
+
+    if unit.source_type == SourceType.OCR_TEXT:
+        if confidence < options.min_ocr_confidence:
+            return 0.0
+        prior *= 0.78
+    elif unit.source_type == SourceType.TABLE_CELL:
+        prior *= 0.94
+        if len(unit.content.strip()) < options.short_table_cell_len:
+            prior *= options.short_table_penalty
+    elif unit.source_type == SourceType.CAPTION:
+        prior *= 0.97
+    else:
+        prior *= 1.0
+
+    if options.enable_recency_boost:
+        age_days = _age_days(unit.timestamp, now_utc=options.now_utc)
+        if age_days is not None and age_days >= 0:
+            half_life = max(options.recency_half_life_days, 1.0)
+            decay = 0.5 ** (age_days / half_life)
+            prior *= 1.0 + min(options.max_recency_boost, max(0.0, decay * options.max_recency_boost))
+
+    return max(0.0, min(prior, 1.5))
+
+
+def _age_days(timestamp: str, *, now_utc: datetime | None = None) -> float | None:
+    try:
+        normalized = timestamp.replace("Z", "+00:00")
+        ts = datetime.fromisoformat(normalized)
+    except Exception:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    now = now_utc or datetime.now(timezone.utc)
+    delta = now - ts.astimezone(timezone.utc)
+    return delta.total_seconds() / 86400.0

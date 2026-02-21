@@ -15,8 +15,12 @@ if "numpy" not in sys.modules:
 
 from investigation_search.engine import InvestigationEngine
 from investigation_search.contradiction import ContradictionPrediction
-from investigation_search.retrieval import QueryPass, retrieve
+from investigation_search.dsl import parse_search_query
+from investigation_search.evaluation import EvaluationCase, evaluate_engine
+from investigation_search.retrieval import QueryPass, RetrievalOptions, build_passes, retrieve
 from investigation_search.schema import EvidenceUnit, SourceType, Verdict
+from investigation_search.viewer import render_result_text
+from investigation_search.websearch import WebSearchResult
 
 
 def _sample_units() -> list[EvidenceUnit]:
@@ -156,3 +160,159 @@ def test_online_learning_progresses_with_searches() -> None:
     assert first.diagnostics["online_learning"]["version"] >= 1
     assert second.diagnostics["online_learning"]["version"] >= first.diagnostics["online_learning"]["version"]
     assert second.diagnostics["online_learning"]["updates"] >= first.diagnostics["online_learning"]["updates"]
+
+
+def test_build_passes_adapts_to_english_query() -> None:
+    passes = build_passes("network latency optimization")
+    assert len(passes) == 3
+    assert "however" in passes[1].query
+    assert "boundary" in passes[2].query
+
+
+def test_low_confidence_ocr_is_filtered_by_quality_prior() -> None:
+    units = [
+        EvidenceUnit(
+            doc_id="doc-text",
+            source_type=SourceType.TEXT_SENTENCE,
+            content="처리 속도 개선 효과가 있다.",
+            section_path="A/1",
+            char_start=0,
+            char_end=16,
+            timestamp="2024-01-01T00:00:00Z",
+            confidence=0.9,
+            metadata={},
+        ),
+        EvidenceUnit(
+            doc_id="doc-ocr",
+            source_type=SourceType.OCR_TEXT,
+            content="처리 속도 개선 효과가 있다.",
+            section_path="A/2",
+            char_start=0,
+            char_end=16,
+            timestamp="2024-01-01T00:00:00Z",
+            confidence=0.1,
+            metadata={},
+        ),
+    ]
+    hits = retrieve(
+        QueryPass(name="pass_a_support", query="처리 속도 개선"),
+        units,
+        top_k=3,
+        options=RetrievalOptions(min_ocr_confidence=0.3),
+    )
+    assert hits
+    assert all(item.evidence.source_type != SourceType.OCR_TEXT for item in hits)
+
+
+def test_delete_user_search_data_clears_cache_and_learning() -> None:
+    engine = InvestigationEngine(_sample_units(), online_learning=True, cache_size=16, cache_ttl_sec=120.0)
+    engine.search("처리 속도 개선", top_k_per_pass=2, time_budget_sec=120)
+    before = engine.learning_snapshot()
+    assert before["searches"] >= 1
+
+    deleted = engine.delete_user_search_data(delete_learning_state_file=False)
+    after = engine.learning_snapshot()
+
+    assert deleted["learning_state_reset"] is True
+    assert deleted["cache_entries_deleted"] >= 1
+    assert after["searches"] == 0
+    assert after["token_boost_count"] == 0
+
+
+def test_parse_search_query_extracts_filters() -> None:
+    parsed = parse_search_query('doc:doc-1 source:text -source:ocr after:2024-01-01 section:A/ "처리 속도"')
+    assert parsed.clean_query == "처리 속도"
+    assert "doc-1" in parsed.filters.doc_ids
+    assert SourceType.TEXT_SENTENCE in parsed.filters.include_source_types
+    assert SourceType.OCR_TEXT in parsed.filters.exclude_source_types
+    assert "A/" in parsed.filters.section_prefixes
+    assert parsed.filters.after == "2024-01-01"
+
+
+def test_engine_search_dsl_filters_results() -> None:
+    engine = InvestigationEngine(_sample_units(), enable_cache=False, online_learning=False)
+    result = engine.search('doc:doc-1 source:text "처리 속도"', top_k_per_pass=3)
+    assert result.evidence
+    assert all(item.evidence.doc_id == "doc-1" for item in result.evidence)
+    assert result.diagnostics["query_dsl"]["clean_query"] == "처리 속도"
+
+
+def test_engine_explain_and_viewer_output() -> None:
+    engine = InvestigationEngine(_sample_units())
+    result = engine.search("처리 속도 개선", top_k_per_pass=2, time_budget_sec=120)
+    explanation = engine.explain(result, max_items=2)
+    rendered = render_result_text(result, query="처리 속도 개선", max_items=2)
+
+    assert explanation["answer"]
+    assert "stage_score_summary" in explanation
+    assert "Answer:" in rendered
+    assert "Evidence:" in rendered
+
+
+def test_evaluation_harness_returns_metrics() -> None:
+    engine = InvestigationEngine(_sample_units(), enable_cache=False, online_learning=False)
+    case = EvaluationCase(query="처리 속도 개선", relevant_doc_ids=("doc-1",), expect_contradiction=True, top_k=3)
+    report = evaluate_engine(engine, [case])
+    assert report.metrics["query_count"] == 1.0
+    assert 0.0 <= report.metrics["mrr"] <= 1.0
+    assert len(report.per_case) == 1
+
+
+def test_web_fallback_uses_provider_when_local_empty() -> None:
+    class StubWebProvider:
+        provider_name = "duckduckgo-stub"
+
+        def search(self, query, *, max_results=5):
+            return [
+                WebSearchResult(
+                    title="외부 검색 제목",
+                    url="https://example.com/a",
+                    snippet="외부 검색 스니펫",
+                    rank=1,
+                    provider=self.provider_name,
+                )
+            ]
+
+    engine = InvestigationEngine(
+        _sample_units(),
+        enable_cache=False,
+        online_learning=False,
+        web_search_provider=StubWebProvider(),
+        enable_web_fallback=True,
+        web_fallback_min_local_hits=1,
+    )
+    result = engine.search("zzzxxyyqq", top_k_per_pass=2, time_budget_sec=120)
+
+    assert result.evidence
+    assert result.evidence[0].evidence.source_type == SourceType.WEB_SNIPPET
+    assert result.diagnostics["web_fallback"]["used"] is True
+    assert result.diagnostics["web_fallback"]["provider"] == "duckduckgo-stub"
+
+
+def test_web_fallback_respects_dsl_source_exclusion() -> None:
+    class StubWebProvider:
+        provider_name = "duckduckgo-stub"
+
+        def search(self, query, *, max_results=5):
+            return [
+                WebSearchResult(
+                    title="외부 검색 제목",
+                    url="https://example.com/a",
+                    snippet="외부 검색 스니펫",
+                    rank=1,
+                    provider=self.provider_name,
+                )
+            ]
+
+    engine = InvestigationEngine(
+        _sample_units(),
+        enable_cache=False,
+        online_learning=False,
+        web_search_provider=StubWebProvider(),
+        enable_web_fallback=True,
+    )
+    result = engine.search('-source:web_snippet "zzzxxyyqq"', top_k_per_pass=2, time_budget_sec=120)
+
+    assert result.evidence == []
+    assert result.diagnostics["web_fallback"]["used"] is False
+    assert result.diagnostics["web_fallback"]["reason"] == "filtered_out_by_query_dsl"

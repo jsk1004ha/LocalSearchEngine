@@ -1,17 +1,14 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Iterable, List, Protocol
 
+from .analyzer import unique_tokens
 from .schema import ScoredEvidence, Verdict
 
 
-_WORD_RE = re.compile(r"[a-zA-Z0-9가-힣]+")
-
-
 def _tokenize(text: str) -> set[str]:
-    return {m.group(0).lower() for m in _WORD_RE.finditer(text)}
+    return unique_tokens(text, mode="classification", include_char_ngrams=True)
 
 
 @dataclass(frozen=True)

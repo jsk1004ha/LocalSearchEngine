@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Sequence
 
-from .retrieval import RetrievalWeights, tokenize
+from .analyzer import tokenize
+from .retrieval import RetrievalWeights
 from .schema import ScoredEvidence
 
 
@@ -38,6 +39,7 @@ class LearningState:
 class OnlineLearningManager:
     def __init__(self, base_weights: RetrievalWeights, config: LearningConfig | None = None):
         self.config = config or LearningConfig()
+        self._base_weights = _weights_from_dataclass(base_weights)
         self.state = LearningState(weights=_weights_from_dataclass(base_weights))
         self._normalize_weights()
         if self.config.state_path:
@@ -106,6 +108,21 @@ class OnlineLearningManager:
             "last_updated": self.state.last_updated,
         }
         out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+
+    def clear(self, *, delete_state_file: bool = False) -> None:
+        self.state.weights = dict(self._base_weights)
+        self._normalize_weights()
+        self.state.token_boosts = {}
+        self.state.searches = 0
+        self.state.updates = 0
+        self.state.version = 0
+        self.state.last_updated = None
+
+        if delete_state_file and self.config.state_path:
+            try:
+                Path(self.config.state_path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
     @property
     def version(self) -> int:
@@ -189,7 +206,7 @@ class OnlineLearningManager:
     def _update_token_boosts(self, query: str, positives: Sequence[ScoredEvidence]) -> None:
         if not positives:
             return
-        query_tokens = set(tokenize(query))
+        query_tokens = set(tokenize(query, mode="learning", include_char_ngrams=False))
         if not query_tokens:
             return
 
@@ -203,7 +220,7 @@ class OnlineLearningManager:
         token_gain = max(0.0, self.config.token_gain)
         max_boost = max(0.0, self.config.max_token_boost)
         for item in positives:
-            evidence_tokens = set(tokenize(item.evidence.content))
+            evidence_tokens = set(tokenize(item.evidence.content, mode="learning", include_char_ngrams=False))
             overlap = query_tokens & evidence_tokens
             if not overlap:
                 continue

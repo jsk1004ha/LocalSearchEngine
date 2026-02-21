@@ -15,6 +15,7 @@
   - evidence 산출물 체크섬 포함 매니페스트 생성
   - `previous_build_dir` 기반 증분 임베딩 재사용(reused/new 벡터 통계 기록)
   - 해시 기반 샤딩 산출물(`shards/shard_xxx`) 생성 및 로딩 지원
+  - BM25 인덱스(`bm25_index.json`) 저장/로드 지원(재시작 비용 절감)
 - **근거 단위 스키마**
   - `text_sentence`, `table_cell`, `caption`, `ocr_text` source type 지원
   - 문서 위치(`section_path`, `char_start`, `char_end`)와 신뢰도(`confidence`) 저장
@@ -23,21 +24,37 @@
   - Pass A: 정방향
   - Pass B: 반증(예외/제한/반대 근거 탐색)
   - Pass C: 경계조건(대상/시점/조건 변경)
+  - 검색 DSL(`doc:`, `source:`, `-source:`, `after:`, `before:`, `section:`) 지원
   - BM25 + Dense + lexical + RRF 융합 스코어
   - cross-encoder 스타일 reranker 후 최종 점수 반영
+  - 남은 time budget에 따라 후보 수 동적 조절
+  - reranker는 상위 후보만 선택적으로 적용(max_rerank_candidates)
+- **분석기(Analyzer) 단일화**
+  - BM25/lexical/reranker/contradiction/learning 전부 공통 토크나이저 사용
+  - 한국어는 문자 n-gram 기본 지원, 형태소 분석은 옵션(`konlpy` 설치 시)
+- **Evidence 품질 가중치**
+  - `confidence`/`source_type`/`timestamp`를 prior로 반영
+  - 저신뢰 OCR 자동 하향(또는 제거), 짧은 table cell 패널티, 최신성 가중 옵션
 - **모순 검출 전용 단계**
   - `ContradictionDetector` 인터페이스와 기본 로컬 heuristic detector
   - NLI/ONNX 런타임 어댑터로 전용 모델 연동 가능
 - **진단 정보(Diagnostics)**
   - 각 pass hit 수, 실행 시간, time budget, 반례 근거 부족 여부 표기
   - rerank 적용/생략 사유, contradiction detector 오버라이드 수, cache hit/miss 포함
+- **Explain/하이라이트**
+  - `engine.explain(result)`로 근거별 score/why/stage를 구조화 출력
+  - `render_result_text()`로 하이라이트된 근거 텍스트 뷰 출력
 - **검색 중 온라인 학습**
   - 검색 결과의 stage score를 이용해 BM25/dense/lexical/RRF 가중치를 점진 업데이트
   - query token boost를 누적 학습하여 다음 검색의 lexical/BM25 스코어에 반영
   - 학습 상태 파일(JSON) 로드/저장 지원
+  - `delete_user_search_data()`로 캐시/학습 상태 즉시 삭제 가능
 - **Ollama 로컬 모델 연동**
   - `ollama:<model>` 임베딩 모델명으로 dense 임베딩을 Ollama `/api/embed`로 생성
   - `OllamaRerankerAdapter`, `OllamaContradictionDetector`로 reranker/NLI 연결
+- **웹 fallback 검색 (DuckDuckGo)**
+  - 로컬 근거가 부족할 때 DuckDuckGo 결과를 `web_snippet` 근거로 자동 병합
+  - DSL에서 `-source:web_snippet`로 외부 검색 결과 제외 가능
 - **엔터티 정규화/집계**
   - 이름/닉네임/아이디/메일 마스킹 표기를 정규화하고 alias 후보를 query expansion에 반영
   - alias 확장 점수 페널티로 오탐을 제어하고 evidence metadata의 `canonical_entity_id` 기준 그룹 집계 지원
@@ -55,6 +72,8 @@
 - PDF 파서: `pdfplumber` 또는 `pypdf`
 - OCR: `pillow`, `pytesseract` (+ 시스템 tesseract 설치)
 - Ollama 연동: 로컬 `ollama serve` 실행
+- 웹 fallback: DuckDuckGo 접근 가능 네트워크
+- 형태소 분석(옵션): `konlpy`
 
 ## 빠른 시작
 
@@ -118,6 +137,7 @@ PY
 - `evidence_units.json`
 - `evidence_embeddings.npy`
 - `ann_index.bin`(또는 fallback 시 `ann_index.npy`) + `ann_index.meta.json`
+- `bm25_index.json`
 - `manifest.json`
 - (옵션) `shards/shard_xxx/*` 분할 아티팩트
 
@@ -140,16 +160,58 @@ engine = InvestigationEngine(
     online_learning=True,
     learning_state_path="artifacts/learning_state.json",
 )
+
+# 사용자 검색 정보 삭제(캐시 + 학습 상태)
+engine.delete_user_search_data(delete_learning_state_file=True)
 ```
+
+## DuckDuckGo fallback 예시
+
+```python
+from investigation_search import DuckDuckGoSearchProvider, InvestigationEngine
+
+engine = InvestigationEngine(
+    units,
+    enable_web_fallback=True,
+    web_search_provider=DuckDuckGoSearchProvider(),
+    web_fallback_min_local_hits=1,
+    web_max_results=3,
+)
+
+# 외부 웹 결과 제외
+result = engine.search('-source:web_snippet "내부 문서에서만 찾기"')
+```
+
+## 평가 Harness
+
+- `evaluate_engine()`로 `Recall@k`, `MRR`, `nDCG@k`, `contradiction hit rate` 계산
+- `EvaluationCase`에 기대 citation/doc/모순 여부를 넣어 회귀 테스트 세트 구성
+- `compare_reports()`로 A/B 실험 성능 차이 계산
+
+## 개인정보/삭제 정책
+
+- 사용자 검색 정보는 엔진 캐시 및 학습 상태(JSON)에만 저장됩니다.
+- `delete_user_search_data()` 호출 시 메모리 캐시와 학습 데이터를 즉시 삭제합니다.
+- 파일 저장을 사용했다면 `delete_learning_state_file=True`로 파일까지 삭제할 수 있습니다.
+
+## 안전 정책
+
+- 시스템 필수 안전 정책(플랫폼/법적 요구사항)은 비활성화할 수 없습니다.
+- 다만 엔진 내부에는 강제 검열 로직을 넣지 않았고, 운영 정책은 애플리케이션 레이어에서 조정 가능합니다.
 
 ## 프로젝트 구조
 
 - `src/investigation_search/schema.py`: 근거/판정/result 모델
 - `src/investigation_search/offline.py`: 오프라인 빌드 및 매니페스트
 - `src/investigation_search/retrieval.py`: BM25 + dense + lexical 하이브리드 후보 결합/중복 병합/판정
+- `src/investigation_search/analyzer.py`: 공통 토크나이저/언어 감지(한국어 n-gram 포함)
+- `src/investigation_search/dsl.py`: 검색 DSL 파싱/필터 적용
 - `src/investigation_search/bm25.py`: BM25 인덱스/검색
 - `src/investigation_search/learning.py`: 검색 중 온라인 학습(가중치/토큰 boost)
 - `src/investigation_search/ollama.py`: Ollama API 클라이언트 + reranker/contradiction 어댑터
+- `src/investigation_search/websearch.py`: DuckDuckGo 웹 검색 공급자/결과 스키마
+- `src/investigation_search/viewer.py`: 하이라이트/설명용 결과 렌더러
+- `src/investigation_search/evaluation.py`: 오프라인 품질 평가 하니스
 - `src/investigation_search/embedding.py`: 로컬 임베딩 모델 로더/인코딩
 - `src/investigation_search/index_ann.py`: ANN 인덱스 빌드/검색/저장/로딩
 - `src/investigation_search/contradiction.py`: 모순 검출 전용 detector 인터페이스/어댑터
