@@ -37,11 +37,25 @@ def encode_texts(
     batch_size: int = 32,
     normalize: bool = True,
 ) -> np.ndarray:
-    model = load_local_model(model_name)
     seq = list(texts)
     if not seq:
         return np.zeros((0, 0), dtype=np.float32)
 
+    if model_name.lower().startswith("ollama:"):
+        from .ollama import OllamaClient
+
+        ollama_model = model_name.split(":", 1)[1].strip()
+        if not ollama_model:
+            raise ValueError("ollama 모델명은 `ollama:<model>` 형식이어야 합니다.")
+        client = OllamaClient()
+        vectors = np.asarray(client.embed(model=ollama_model, texts=seq), dtype=np.float32)
+        if normalize and vectors.size > 0:
+            norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+            norms[norms == 0.0] = 1.0
+            vectors = vectors / norms
+        return vectors
+
+    model = load_local_model(model_name)
     prefix = _prefix_for(model_name, text_type)
     model_inputs = [f"{prefix}{text}" for text in seq]
     vectors = model.encode(

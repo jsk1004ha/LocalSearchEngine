@@ -14,8 +14,9 @@ if "numpy" not in sys.modules:
     )
 
 from investigation_search.engine import InvestigationEngine
+from investigation_search.contradiction import ContradictionPrediction
 from investigation_search.retrieval import QueryPass, retrieve
-from investigation_search.schema import EvidenceUnit, SourceType
+from investigation_search.schema import EvidenceUnit, SourceType, Verdict
 
 
 def _sample_units() -> list[EvidenceUnit]:
@@ -103,3 +104,55 @@ def test_query_expansion_penalty_and_entity_grouping() -> None:
     assert "entity-alpha" in groups
     assert "null" in groups
     assert groups["entity-alpha"]["count"] >= 1
+
+
+def test_search_cache_hit_diagnostics() -> None:
+    engine = InvestigationEngine(_sample_units(), cache_ttl_sec=100.0, cache_size=16)
+    first = engine.search("처리 속도 개선", top_k_per_pass=2, time_budget_sec=120)
+    second = engine.search("처리 속도 개선", top_k_per_pass=2, time_budget_sec=120)
+
+    assert first.diagnostics["cache"]["status"] == "miss"
+    assert second.diagnostics["cache"]["status"] == "hit"
+
+
+def test_contradiction_detector_can_override_verdict() -> None:
+    class StubDetector:
+        model_name = "stub-contradiction"
+        model_version = "test"
+
+        def predict(self, query, candidates):
+            return [
+                ContradictionPrediction(
+                    verdict=Verdict.CONTRADICTS,
+                    score=0.99,
+                    rationale="force_contradiction",
+                )
+                for _ in candidates
+            ]
+
+    engine = InvestigationEngine(_sample_units(), contradiction_detector=StubDetector())
+    result = engine.search("처리 속도 개선", top_k_per_pass=2, time_budget_sec=120)
+
+    assert result.evidence
+    assert all(item.verdict == Verdict.CONTRADICTS for item in result.evidence)
+    assert result.diagnostics["contradiction_detector"]["overrides"] >= 1
+
+
+def test_search_results_always_include_sources() -> None:
+    engine = InvestigationEngine(_sample_units())
+    result = engine.search("처리 속도 개선", top_k_per_pass=2, time_budget_sec=120)
+
+    assert result.sources
+    assert result.answer_sources
+    assert all(item.source is not None for item in result.evidence)
+    assert all(src.citation_id for src in result.sources)
+
+
+def test_online_learning_progresses_with_searches() -> None:
+    engine = InvestigationEngine(_sample_units(), enable_cache=False, online_learning=True)
+    first = engine.search("처리 속도 개선", top_k_per_pass=2, time_budget_sec=120)
+    second = engine.search("조건 변경 성능 향상", top_k_per_pass=2, time_budget_sec=120)
+
+    assert first.diagnostics["online_learning"]["version"] >= 1
+    assert second.diagnostics["online_learning"]["version"] >= first.diagnostics["online_learning"]["version"]
+    assert second.diagnostics["online_learning"]["updates"] >= first.diagnostics["online_learning"]["updates"]

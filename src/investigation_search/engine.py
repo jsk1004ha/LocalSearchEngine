@@ -1,14 +1,34 @@
 from __future__ import annotations
 
+import hashlib
 import time
 from collections import defaultdict
-from typing import Dict, Iterable, List, Optional
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence
 
+from .bm25 import BM25Index
+from .contradiction import ContradictionDetector, HeuristicContradictionDetector
 from .embedding import DEFAULT_EMBEDDING_MODEL
 from .index_ann import ANNIndex
+from .learning import LearningConfig, OnlineLearningManager
 from .reranker import LocalCrossEncoderReranker, Reranker
-from .retrieval import build_passes, retrieve
-from .schema import EvidenceUnit, ScoredEvidence, SearchResult, Verdict
+from .retrieval import QueryPass, RetrievalWeights, build_bm25_for_units, build_passes, retrieve
+from .schema import EvidenceUnit, ScoredEvidence, SearchResult, SourceCitation, Verdict, build_source_citation
+
+
+@dataclass(frozen=True)
+class _ShardRuntime:
+    shard_id: int
+    units: List[EvidenceUnit]
+    ann_index: ANNIndex | None
+    bm25_index: BM25Index
+
+
+@dataclass
+class _CacheEntry:
+    created_at: float
+    result: SearchResult
 
 
 class InvestigationEngine:
@@ -18,14 +38,62 @@ class InvestigationEngine:
         build_id: Optional[str] = None,
         *,
         ann_index: ANNIndex | None = None,
+        ann_shards: Sequence[ANNIndex] | None = None,
+        bm25_index: BM25Index | None = None,
+        bm25_shards: Sequence[BM25Index] | None = None,
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         reranker: Reranker | None = None,
+        contradiction_detector: ContradictionDetector | None = None,
+        retrieval_weights: RetrievalWeights | None = None,
+        shard_count: int = 1,
+        enable_cache: bool = True,
+        cache_size: int = 128,
+        cache_ttl_sec: float = 90.0,
+        online_learning: bool = True,
+        learning_state_path: str | None = None,
+        learning_rate: float = 0.08,
+        learning_autosave_every: int = 20,
     ):
         self.evidence_units = list(evidence_units)
         self.build_id = build_id
-        self.ann_index = ann_index
+        self.shard_count = max(1, int(shard_count))
         self.embedding_model = embedding_model
         self.reranker = reranker or LocalCrossEncoderReranker()
+        self.contradiction_detector = contradiction_detector or HeuristicContradictionDetector()
+        self.retrieval_weights = retrieval_weights or RetrievalWeights()
+        self.enable_cache = enable_cache
+        self.cache_size = max(0, cache_size)
+        self.cache_ttl_sec = max(0.0, cache_ttl_sec)
+        self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
+        self._learner = OnlineLearningManager(
+            self.retrieval_weights,
+            LearningConfig(
+                enabled=online_learning,
+                learning_rate=learning_rate,
+                autosave_every=max(1, learning_autosave_every),
+                state_path=learning_state_path,
+            ),
+        )
+
+        shard_units = self._partition_units(self.evidence_units, self.shard_count)
+        ann_by_shard = self._prepare_ann_shards(ann_index=ann_index, ann_shards=ann_shards, shard_count=self.shard_count)
+        bm25_by_shard = self._prepare_bm25_shards(
+            shard_units=shard_units,
+            bm25_index=bm25_index,
+            bm25_shards=bm25_shards,
+        )
+
+        self._shards: list[_ShardRuntime] = []
+        for shard_id in range(self.shard_count):
+            units = shard_units[shard_id]
+            self._shards.append(
+                _ShardRuntime(
+                    shard_id=shard_id,
+                    units=units,
+                    ann_index=ann_by_shard[shard_id],
+                    bm25_index=bm25_by_shard[shard_id],
+                )
+            )
 
     def search(
         self,
@@ -33,9 +101,25 @@ class InvestigationEngine:
         top_k_per_pass: int = 5,
         time_budget_sec: int = 120,
     ) -> SearchResult:
+        cache_key = self._cache_key(query=query, top_k_per_pass=top_k_per_pass, time_budget_sec=time_budget_sec)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return self._with_cache_status(cached, status="hit", learning_meta=self._learner.snapshot())
+
         start = time.time()
         selected: List[ScoredEvidence] = []
         pass_stats: Dict[str, object] = {}
+        pass_stats["cache"] = {"status": "miss"}
+        pass_stats["sharding"] = {"shard_count": self.shard_count}
+        pass_stats["online_learning"] = self._learner.snapshot()
+        active_weights = self._learner.current_weights()
+        active_token_boosts = self._learner.current_token_boosts()
+        pass_stats["retrieval_weights"] = {
+            "bm25": active_weights.bm25,
+            "dense": active_weights.dense,
+            "lexical": active_weights.lexical,
+            "rrf": active_weights.rrf,
+        }
 
         for qp in build_passes(query):
             elapsed = time.time() - start
@@ -44,15 +128,17 @@ class InvestigationEngine:
                 pass_stats[qp.name] = "skipped_time_budget"
                 continue
 
-            hits = retrieve(
-                qp,
-                self.evidence_units,
+            hits, shard_hits = self._retrieve_from_shards(
+                qp.query,
+                qp.name,
                 top_k=top_k_per_pass,
-                ann_index=self.ann_index,
-                embedding_model=self.embedding_model,
+                weights=active_weights,
+                token_boosts=active_token_boosts,
             )
             selected.extend(hits)
-            pass_stats[qp.name] = f"{len(hits)} hits"
+            pass_stats[qp.name] = {"hits": len(hits), "shards": shard_hits}
+
+        selected = self._dedupe_candidates(selected)
 
         rerank_budget_sec = 0.015 * max(len(selected), 1)
         rerank_meta: Dict[str, object] = {
@@ -80,6 +166,14 @@ class InvestigationEngine:
                 reranked = self._rerank(query, selected)
                 rerank_meta["reason"] = "applied"
 
+        detector_meta = {
+            "model": self.contradiction_detector.model_name,
+            "version": self.contradiction_detector.model_version,
+            "overrides": 0,
+        }
+        if reranked:
+            reranked, detector_meta = self._apply_contradiction_detector(query, reranked, detector_meta)
+
         reranked.sort(key=lambda s: s.score, reverse=True)
         best = reranked[: max(top_k_per_pass, 3)]
 
@@ -88,20 +182,30 @@ class InvestigationEngine:
 
         if supports:
             answer = supports[0].evidence.content
+            answer_source = supports[0].source or build_source_citation(supports[0].evidence)
         elif best:
             answer = best[0].evidence.content
+            answer_source = best[0].source or build_source_citation(best[0].evidence)
         else:
             answer = "근거를 찾지 못했습니다."
+            answer_source = None
 
         if not contradictions and best:
             pass_stats["disconfirming_check"] = "insufficient_contradicting_evidence"
 
+        sources = self._collect_sources(best)
+        if answer_source is not None:
+            pass_stats["answer_source"] = answer_source.citation_id
+        pass_stats["source_count"] = len(sources)
+
+        end_ts = time.time()
         pass_stats["rerank"] = rerank_meta
+        pass_stats["contradiction_detector"] = detector_meta
         pass_stats["entity_groups"] = self._group_by_entity(best)
-        pass_stats["elapsed_sec"] = f"{time.time() - start:.3f}"
+        pass_stats["elapsed_sec"] = f"{end_ts - start:.3f}"
         pass_stats["time_budget_sec"] = str(time_budget_sec)
 
-        return SearchResult(
+        result = SearchResult(
             answer=answer,
             evidence=best,
             contradictions=contradictions,
@@ -109,7 +213,12 @@ class InvestigationEngine:
             reranker_model=self.reranker.model_name,
             reranker_version=self.reranker.model_version,
             build_id=self.build_id,
+            answer_sources=[answer_source] if answer_source is not None else [],
+            sources=sources,
         )
+        pass_stats["online_learning"] = self._learner.learn(query, best)
+        self._cache_put(cache_key, result, created_at=end_ts)
+        return result
 
     def _annotate_initial_scores(self, candidates: List[ScoredEvidence]) -> List[ScoredEvidence]:
         return [
@@ -119,6 +228,7 @@ class InvestigationEngine:
                 verdict=candidate.verdict,
                 why_it_matches=candidate.why_it_matches,
                 stage_scores={**candidate.stage_scores, "first_pass": candidate.score},
+                source=candidate.source or build_source_citation(candidate.evidence),
             )
             for candidate in candidates
         ]
@@ -140,10 +250,10 @@ class InvestigationEngine:
                         "rerank": rerank_score,
                         "final": final_score,
                     },
+                    source=candidate.source or build_source_citation(candidate.evidence),
                 )
             )
         return reranked
-
 
     def _group_by_entity(self, evidence_items: List[ScoredEvidence]) -> Dict[str, object]:
         grouped: dict[str, list[ScoredEvidence]] = defaultdict(list)
@@ -162,3 +272,221 @@ class InvestigationEngine:
             }
             for key, items in grouped.items()
         }
+
+    def _retrieve_from_shards(
+        self,
+        query: str,
+        pass_name: str,
+        *,
+        top_k: int,
+        weights: RetrievalWeights,
+        token_boosts: Dict[str, float],
+    ) -> tuple[List[ScoredEvidence], Dict[str, int]]:
+        shard_hits: dict[str, int] = {}
+        all_hits: list[ScoredEvidence] = []
+
+        for shard in self._shards:
+            if not shard.units:
+                shard_hits[str(shard.shard_id)] = 0
+                continue
+            hits = retrieve(
+                query_pass=QueryPass(name=pass_name, query=query),
+                evidence_units=shard.units,
+                top_k=max(top_k, 2),
+                bm25_index=shard.bm25_index,
+                ann_index=shard.ann_index,
+                embedding_model=self.embedding_model,
+                weights=weights,
+                token_boosts=token_boosts,
+            )
+            all_hits.extend(hits)
+            shard_hits[str(shard.shard_id)] = len(hits)
+
+        merged = self._dedupe_candidates(all_hits)
+        merged.sort(key=lambda item: item.score, reverse=True)
+        return merged[:top_k], shard_hits
+
+    def _dedupe_candidates(self, candidates: List[ScoredEvidence]) -> List[ScoredEvidence]:
+        merged: dict[tuple[str, int, int], ScoredEvidence] = {}
+        for candidate in candidates:
+            key = (candidate.evidence.doc_id, candidate.evidence.char_start, candidate.evidence.char_end)
+            prev = merged.get(key)
+            if prev is None:
+                merged[key] = candidate
+                continue
+            if candidate.score >= prev.score:
+                merged[key] = ScoredEvidence(
+                    evidence=candidate.evidence,
+                    score=candidate.score,
+                    verdict=candidate.verdict,
+                    why_it_matches=f"{prev.why_it_matches} + {candidate.why_it_matches}",
+                    stage_scores={**prev.stage_scores, **candidate.stage_scores},
+                    source=candidate.source or prev.source or build_source_citation(candidate.evidence),
+                )
+            else:
+                merged[key] = ScoredEvidence(
+                    evidence=prev.evidence,
+                    score=prev.score,
+                    verdict=prev.verdict,
+                    why_it_matches=f"{prev.why_it_matches} + {candidate.why_it_matches}",
+                    stage_scores={**prev.stage_scores, **candidate.stage_scores},
+                    source=prev.source or candidate.source or build_source_citation(prev.evidence),
+                )
+        return list(merged.values())
+
+    def _apply_contradiction_detector(
+        self,
+        query: str,
+        candidates: List[ScoredEvidence],
+        detector_meta: Dict[str, object],
+    ) -> tuple[List[ScoredEvidence], Dict[str, object]]:
+        predictions = self.contradiction_detector.predict(query, candidates)
+        updated: list[ScoredEvidence] = []
+        overrides = 0
+
+        for candidate, prediction in zip(candidates, predictions):
+            verdict = candidate.verdict
+            if prediction.score >= 0.55:
+                if verdict != prediction.verdict:
+                    overrides += 1
+                verdict = prediction.verdict
+            updated.append(
+                ScoredEvidence(
+                    evidence=candidate.evidence,
+                    score=candidate.score,
+                    verdict=verdict,
+                    why_it_matches=f"{candidate.why_it_matches}, contradiction={prediction.rationale}:{prediction.score:.3f}",
+                    stage_scores={**candidate.stage_scores, "contradiction_score": prediction.score},
+                    source=candidate.source or build_source_citation(candidate.evidence),
+                )
+            )
+
+        detector_meta = dict(detector_meta)
+        detector_meta["overrides"] = overrides
+        detector_meta["candidate_count"] = len(candidates)
+        return updated, detector_meta
+
+    def _partition_units(self, units: List[EvidenceUnit], shard_count: int) -> List[List[EvidenceUnit]]:
+        partitions = [[] for _ in range(shard_count)]
+        for unit in units:
+            shard_id = self._shard_for_doc(unit.doc_id, shard_count)
+            partitions[shard_id].append(unit)
+        return partitions
+
+    def _prepare_ann_shards(
+        self,
+        *,
+        ann_index: ANNIndex | None,
+        ann_shards: Sequence[ANNIndex] | None,
+        shard_count: int,
+    ) -> List[ANNIndex | None]:
+        if shard_count == 1:
+            if ann_shards is None:
+                return [ann_index]
+            if len(ann_shards) != 1:
+                raise ValueError("shard_count=1일 때 ann_shards 길이는 1이어야 합니다.")
+            return [ann_shards[0]]
+        if ann_shards is None:
+            return [None for _ in range(shard_count)]
+        if len(ann_shards) != shard_count:
+            raise ValueError("ann_shards 길이는 shard_count와 같아야 합니다.")
+        return list(ann_shards)
+
+    def _prepare_bm25_shards(
+        self,
+        *,
+        shard_units: List[List[EvidenceUnit]],
+        bm25_index: BM25Index | None,
+        bm25_shards: Sequence[BM25Index] | None,
+    ) -> List[BM25Index]:
+        if self.shard_count == 1:
+            if bm25_shards:
+                if len(bm25_shards) != 1:
+                    raise ValueError("shard_count=1일 때 bm25_shards 길이는 1이어야 합니다.")
+                return [bm25_shards[0]]
+            if bm25_index is not None:
+                return [bm25_index]
+            return [build_bm25_for_units(shard_units[0])]
+
+        if bm25_shards is not None:
+            if len(bm25_shards) != self.shard_count:
+                raise ValueError("bm25_shards 길이는 shard_count와 같아야 합니다.")
+            return list(bm25_shards)
+
+        return [build_bm25_for_units(units) for units in shard_units]
+
+    def _cache_key(self, *, query: str, top_k_per_pass: int, time_budget_sec: int) -> str:
+        learning_bucket = self._learner.version // 10
+        payload = (
+            f"{self.build_id}|{self.embedding_model}|{self.shard_count}|"
+            f"{top_k_per_pass}|{time_budget_sec}|{len(self.evidence_units)}|"
+            f"{learning_bucket}|{query.strip().lower()}"
+        )
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+    def _cache_get(self, key: str) -> SearchResult | None:
+        if not self.enable_cache or self.cache_size <= 0:
+            return None
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        now = time.time()
+        if (now - entry.created_at) > self.cache_ttl_sec:
+            self._cache.pop(key, None)
+            return None
+        self._cache.move_to_end(key)
+        return entry.result
+
+    def _cache_put(self, key: str, result: SearchResult, *, created_at: float | None = None) -> None:
+        if not self.enable_cache or self.cache_size <= 0:
+            return
+        if created_at is None:
+            created_at = time.time()
+        self._cache[key] = _CacheEntry(created_at=created_at, result=result)
+        self._cache.move_to_end(key)
+        while len(self._cache) > self.cache_size:
+            self._cache.popitem(last=False)
+
+    def _with_cache_status(self, result: SearchResult, *, status: str, learning_meta: Dict[str, object]) -> SearchResult:
+        diagnostics = dict(result.diagnostics)
+        prev_cache = diagnostics.get("cache")
+        if isinstance(prev_cache, dict):
+            cache_meta = dict(prev_cache)
+        else:
+            cache_meta = {}
+        cache_meta["status"] = status
+        diagnostics["cache"] = cache_meta
+        diagnostics["online_learning"] = learning_meta
+        return SearchResult(
+            answer=result.answer,
+            evidence=result.evidence,
+            contradictions=result.contradictions,
+            diagnostics=diagnostics,
+            reranker_model=result.reranker_model,
+            reranker_version=result.reranker_version,
+            build_id=result.build_id,
+            answer_sources=result.answer_sources,
+            sources=result.sources,
+        )
+
+    def _collect_sources(self, items: Sequence[ScoredEvidence]) -> List[SourceCitation]:
+        out: list[SourceCitation] = []
+        seen: set[str] = set()
+        for item in items:
+            source = item.source or build_source_citation(item.evidence)
+            if source.citation_id in seen:
+                continue
+            seen.add(source.citation_id)
+            out.append(source)
+        return out
+
+    def learning_snapshot(self) -> Dict[str, object]:
+        return self._learner.snapshot()
+
+    def save_learning_state(self, path: str | None = None) -> None:
+        self._learner.save(path)
+
+    @staticmethod
+    def _shard_for_doc(doc_id: str, shard_count: int) -> int:
+        digest = hashlib.sha1(doc_id.encode("utf-8")).digest()
+        return int.from_bytes(digest[:4], byteorder="big", signed=False) % shard_count
