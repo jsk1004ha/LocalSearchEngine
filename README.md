@@ -23,6 +23,14 @@
 - **진단 정보(Diagnostics)**
   - 각 pass hit 수, 실행 시간, time budget, 반례 근거 부족 여부 표기
 
+## 의존성
+
+dense 검색 경로를 사용하려면 아래 패키지가 필요합니다.
+
+- `numpy`
+- `sentence-transformers`
+- `hnswlib` 또는 `faiss-cpu` (없으면 exact fallback)
+
 ## 빠른 시작
 
 ```bash
@@ -63,11 +71,37 @@ PY
 
 > 위 예시는 로컬 패키지 경로를 위해 `PYTHONPATH=src` 또는 설치 후 실행해야 합니다.
 
+
+## 임베딩/ANN 권장 설정 (CPU)
+
+- 권장 임베딩 모델
+  - `intfloat/multilingual-e5-small` (384d, 한국어/영어 혼합 질의에 안정적)
+  - `BAAI/bge-small-en-v1.5` (384d, 영문 중심 코퍼스)
+- 권장 인덱스
+  - 기본: HNSW (`M=32`, `ef_construction=200`, `ef_search=64`)
+  - 대규모 데이터(수백만 단위): FAISS IVF (`nlist=256` 이상)
+- 메모리 가이드(대략)
+  - 임베딩 행렬: `문서수 N * 384 * 4 bytes` (float32)
+    - 예: 100,000 span ≈ 146MB
+  - HNSW 그래프 오버헤드: 데이터 분포에 따라 임베딩 메모리의 약 1.2~2.0배 추가
+  - 운영시 여유 메모리(파이썬 런타임/버퍼 포함)로 최소 2~3배를 권장
+
+오프라인 빌드 시 `write_build()`는 다음 산출물을 생성합니다.
+
+- `evidence_units.json`
+- `evidence_embeddings.npy`
+- `ann_index.bin`(또는 fallback 시 `ann_index.npy`) + `ann_index.meta.json`
+- `manifest.json`
+
+온라인 검색은 lexical 후보와 ANN 후보를 합쳐 `doc_id + (char_start, char_end)` 기준으로 중복 병합한 뒤 재랭킹합니다.
+
 ## 프로젝트 구조
 
 - `src/investigation_search/schema.py`: 근거/판정/result 모델
 - `src/investigation_search/offline.py`: 오프라인 빌드 및 매니페스트
-- `src/investigation_search/retrieval.py`: 멀티패스용 쿼리 생성/점수화/판정
+- `src/investigation_search/retrieval.py`: lexical + dense 후보 결합/중복 병합/판정
+- `src/investigation_search/embedding.py`: 로컬 임베딩 모델 로더/인코딩
+- `src/investigation_search/index_ann.py`: ANN 인덱스 빌드/검색/저장/로딩
 - `src/investigation_search/engine.py`: 시간 예산 기반 조사형 검색 실행기
 - `VERSION`: 프로젝트 버전
 - `agent.md`: 이 저장소에서 작업하는 에이전트용 운영 규칙
