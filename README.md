@@ -1,5 +1,8 @@
 # Local Investigation Search Engine
 
+
+> 정책: 본 프로젝트의 엔터티 정규화/검색 기능은 **동의·합법 데이터 범위에서만 사용**해야 하며, 개인 식별 목적의 사용을 금지합니다.
+
 개인용 PC 환경에서 동작하는 **조사형 검색 엔진(Investigation Search Engine)**의 최소 구현체입니다.
 목표는 단순 유사도 검색이 아니라 아래 4가지를 함께 반환하는 것입니다.
 
@@ -22,6 +25,9 @@
   - Pass C: 경계조건(대상/시점/조건 변경)
 - **진단 정보(Diagnostics)**
   - 각 pass hit 수, 실행 시간, time budget, 반례 근거 부족 여부 표기
+- **엔터티 정규화/집계**
+  - 이름/닉네임/아이디/메일 마스킹 표기를 정규화하고 alias 후보를 query expansion에 반영
+  - alias 확장 점수 페널티로 오탐을 제어하고 evidence metadata의 `canonical_entity_id` 기준 그룹 집계 지원
 
 ## 의존성
 

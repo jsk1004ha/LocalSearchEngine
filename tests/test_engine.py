@@ -14,6 +14,7 @@ if "numpy" not in sys.modules:
     )
 
 from investigation_search.engine import InvestigationEngine
+from investigation_search.retrieval import QueryPass, retrieve
 from investigation_search.schema import EvidenceUnit, SourceType
 
 
@@ -28,6 +29,7 @@ def _sample_units() -> list[EvidenceUnit]:
             char_end=25,
             timestamp="2024-01-01T00:00:00Z",
             confidence=0.9,
+            metadata={"canonical_entity_id": "entity-alpha"},
         ),
         EvidenceUnit(
             doc_id="doc-2",
@@ -38,6 +40,7 @@ def _sample_units() -> list[EvidenceUnit]:
             char_end=53,
             timestamp="2024-01-01T00:00:00Z",
             confidence=0.8,
+            metadata={"canonical_entity_id": None},
         ),
         EvidenceUnit(
             doc_id="doc-3",
@@ -48,6 +51,7 @@ def _sample_units() -> list[EvidenceUnit]:
             char_end=86,
             timestamp="2024-01-01T00:00:00Z",
             confidence=0.7,
+            metadata={"canonical_entity_id": "entity-alpha"},
         ),
     ]
 
@@ -83,3 +87,19 @@ def test_search_rerank_skipped_when_time_budget_exceeded_keeps_sorted_scores() -
 
     scores = [item.score for item in result.evidence]
     assert scores == sorted(scores, reverse=True)
+
+
+def test_query_expansion_penalty_and_entity_grouping() -> None:
+    units = _sample_units()
+    hits = retrieve(QueryPass(name="pass_a_support", query="처리 속도개선"), units, top_k=3)
+
+    assert hits
+    assert any("alias_penalty" in item.stage_scores for item in hits)
+
+    engine = InvestigationEngine(units)
+    result = engine.search("처리 속도개선", top_k_per_pass=5, time_budget_sec=120)
+    groups = result.diagnostics["entity_groups"]
+
+    assert "entity-alpha" in groups
+    assert "null" in groups
+    assert groups["entity-alpha"]["count"] >= 1
