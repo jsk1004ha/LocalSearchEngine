@@ -15,9 +15,20 @@ def load_local_model(model_name: str = DEFAULT_EMBEDDING_MODEL):
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError(
-            "sentence-transformers가 필요합니다. `pip install sentence-transformers` 후 재시도하세요."
-        ) from exc
+        from .bootstrap import auto_install_enabled, ensure_installed, requirements_path
+
+        if auto_install_enabled():
+            req = requirements_path("requirements-search.txt")
+            ensure_installed(
+                requirements_files=[req] if req is not None else None,
+                packages=("sentence-transformers",),
+                auto_install=True,
+            )
+            from sentence_transformers import SentenceTransformer
+        else:
+            raise RuntimeError(
+                "sentence-transformers가 필요합니다. `pip install sentence-transformers` 후 재시도하세요."
+            ) from exc
 
     return SentenceTransformer(model_name, device="cpu")
 

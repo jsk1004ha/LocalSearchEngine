@@ -1,0 +1,3 @@
+# Core runtime deps (engine import path)
+numpy>=1.26
+

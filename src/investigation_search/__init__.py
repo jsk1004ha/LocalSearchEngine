@@ -13,6 +13,7 @@ from .entity import AliasCandidate, generate_alias_candidates, normalize_masked_
 from .evaluation import EvaluationCase, EvaluationReport, compare_reports, evaluate_engine
 from .index_ann import build_index, load_index, save_index, search_index
 from .library import KnowledgeLibrary
+from .library_viewer import export_knowledge_library, list_knowledge_library_sessions, load_knowledge_library_session
 from .learning import LearningConfig, LearningState, OnlineLearningManager
 from .modes import ModeProfile, SearchMode, build_passes_for_mode, parse_mode, profile_for_mode
 from .ollama import OllamaClient, OllamaContradictionDetector, OllamaRerankerAdapter
@@ -40,7 +41,8 @@ from .schema import (
     build_source_citation,
 )
 from .viewer import highlight_text, render_result_text, summarize_stage_scores
-from .websearch import DuckDuckGoSearchProvider, WebSearchProvider, WebSearchResult
+from .websearch import DuckDuckGoSearchProvider, SubprocessSandboxWebSearchProvider, WebSearchProvider, WebSearchResult
+from .publisher import publish_knowledge_library_pdf, publish_knowledge_library_zip
 
 __all__ = [
     "InvestigationEngine",
@@ -71,6 +73,9 @@ __all__ = [
     "LearningState",
     "OnlineLearningManager",
     "KnowledgeLibrary",
+    "list_knowledge_library_sessions",
+    "load_knowledge_library_session",
+    "export_knowledge_library",
     "SearchMode",
     "ModeProfile",
     "parse_mode",
@@ -116,6 +121,9 @@ __all__ = [
     "WebSearchProvider",
     "WebSearchResult",
     "DuckDuckGoSearchProvider",
+    "SubprocessSandboxWebSearchProvider",
     "SourceType",
     "Verdict",
+    "publish_knowledge_library_zip",
+    "publish_knowledge_library_pdf",
 ]

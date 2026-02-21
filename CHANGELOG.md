@@ -2,6 +2,14 @@
 
 This project uses `VERSION` as the single source of truth.
 
+## 0.9.0
+
+- Auto-install bootstrap + web search subprocess isolation
+
+## 0.8.0
+
+- TUI + knowledge library export/publish + requirements files
+
 ## 0.7.0
 
 - Multi search modes + knowledge library persistence

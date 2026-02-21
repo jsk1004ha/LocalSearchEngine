@@ -30,7 +30,7 @@ from .retrieval import (
 )
 from .schema import EvidenceUnit, ScoredEvidence, SearchResult, SourceCitation, SourceType, Verdict, build_source_citation
 from .viewer import summarize_stage_scores
-from .websearch import DuckDuckGoSearchProvider, WebSearchProvider
+from .websearch import DuckDuckGoSearchProvider, SubprocessSandboxWebSearchProvider, WebSearchProvider
 
 
 @dataclass(frozen=True)
@@ -76,6 +76,9 @@ class InvestigationEngine:
         web_fallback_min_local_hits: int = 1,
         web_max_results: int = 3,
         web_search_provider: WebSearchProvider | None = None,
+        enable_web_sandbox: bool = True,
+        web_sandbox_timeout_sec: float = 14.0,
+        web_sandbox_max_bytes: int = 1_500_000,
         enable_knowledge_library: bool = False,
         knowledge_library_dir: str | Path = Path("artifacts") / "knowledge_library",
         trusted_domains: Sequence[str] | None = None,
@@ -96,7 +99,19 @@ class InvestigationEngine:
         self.enable_web_fallback = bool(enable_web_fallback)
         self.web_fallback_min_local_hits = max(0, int(web_fallback_min_local_hits))
         self.web_max_results = max(1, int(web_max_results))
-        self.web_search_provider = web_search_provider or DuckDuckGoSearchProvider()
+        if web_search_provider is not None:
+            self.web_search_provider = web_search_provider
+        else:
+            if enable_web_sandbox:
+                self.web_search_provider = SubprocessSandboxWebSearchProvider(
+                    timeout_sec=max(1.0, float(web_sandbox_timeout_sec)),
+                    max_bytes=max(0, int(web_sandbox_max_bytes)),
+                )
+            else:
+                self.web_search_provider = DuckDuckGoSearchProvider(
+                    timeout_sec=max(1.0, float(web_sandbox_timeout_sec)),
+                    max_bytes=max(0, int(web_sandbox_max_bytes)),
+                )
         self.trusted_domains = {d.strip().lower() for d in (trusted_domains or []) if str(d).strip()}
         self._library = KnowledgeLibrary(knowledge_library_dir) if enable_knowledge_library else None
         self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()

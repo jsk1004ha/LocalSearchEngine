@@ -394,3 +394,85 @@ def test_fbi_mode_emits_osint_graph_and_timeline() -> None:
     assert "timeline" in osint
     assert osint["graph"]["node_count"] >= 3
     assert osint["timeline"][0]["date"] == "2024-01-02"
+
+
+def test_library_export_generates_html_pages() -> None:
+    class StubWebProvider:
+        provider_name = "duckduckgo-stub"
+
+        def search(self, query, *, max_results=5):
+            return [
+                WebSearchResult(
+                    title="Incident report 2024-01-02",
+                    url="https://example.com/a",
+                    snippet="Update on 2024-01-03 with details",
+                    rank=1,
+                    provider=self.provider_name,
+                )
+            ]
+
+    with tempfile.TemporaryDirectory() as td:
+        lib_dir = Path(td) / "library"
+        out_dir = Path(td) / "export"
+        engine = InvestigationEngine(
+            _sample_units(),
+            enable_cache=False,
+            online_learning=False,
+            web_search_provider=StubWebProvider(),
+            enable_web_fallback=True,
+            enable_knowledge_library=True,
+            knowledge_library_dir=lib_dir,
+        )
+        result = engine.search("zzzxxyyqq", mode="fbi")
+        session_id = result.diagnostics.get("knowledge_library_session_id")
+        assert session_id
+
+        from investigation_search.library_viewer import export_knowledge_library
+
+        report = export_knowledge_library(lib_dir, out_dir, format="html", include_raw=True)
+        assert report["exported_sessions"] >= 1
+        assert (out_dir / "index.html").exists()
+        assert (out_dir / "sessions" / f"{session_id}.html").exists()
+        assert (out_dir / "osint" / f"{session_id}.dot").exists()
+
+
+def test_library_publish_zip_creates_archive() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        lib_dir = Path(td) / "library"
+        out_zip = Path(td) / "bundle.zip"
+        engine = InvestigationEngine(
+            _sample_units(),
+            enable_cache=False,
+            online_learning=False,
+            enable_knowledge_library=True,
+            knowledge_library_dir=lib_dir,
+        )
+        result = engine.search("처리 속도 개선", mode="investigation")
+        session_id = result.diagnostics.get("knowledge_library_session_id")
+        assert session_id
+
+        from investigation_search.publisher import publish_knowledge_library_zip
+
+        out = publish_knowledge_library_zip(lib_dir, out_zip, export_format="md", session_ids=[session_id])
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+
+def test_subprocess_sandbox_web_provider_parses_json() -> None:
+    from investigation_search.websearch import SubprocessSandboxWebSearchProvider
+
+    class DummyProc:
+        stdout = (
+            '{'
+            '"ok": true,'
+            '"results": ['
+            '{"title":"t","url":"https://example.com/a","snippet":"s","rank":1,"provider":"duckduckgo"}'
+            "]"
+            "}"
+        )
+
+    with patch("investigation_search.websearch.subprocess.run", return_value=DummyProc()):
+        provider = SubprocessSandboxWebSearchProvider(timeout_sec=1.0)
+        rows = provider.search("hello", max_results=2)
+        assert rows
+        assert rows[0].url == "https://example.com/a"

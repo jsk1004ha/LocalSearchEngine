@@ -1,0 +1,3 @@
+# Publishing (PDF export)
+fpdf2>=2.7.8
+

@@ -1,0 +1,5 @@
+# Hybrid retrieval (dense embeddings + ANN) + core runtime
+-r requirements-core.txt
+sentence-transformers>=2.6.1
+hnswlib>=0.8.0
+

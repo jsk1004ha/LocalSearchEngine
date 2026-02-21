@@ -85,6 +85,13 @@ def _parse_pdf(path: Path, doc_id: str, timestamp: str, config: ParseConfig) -> 
     except ImportError:
         pdfplumber = None
 
+    if pdfplumber is None:
+        _maybe_install_docparse_deps()
+        try:
+            import pdfplumber  # type: ignore[import-not-found]
+        except ImportError:
+            pdfplumber = None
+
     if pdfplumber is not None:
         with pdfplumber.open(path) as pdf:
             offset = 0
@@ -161,9 +168,13 @@ def _parse_pdf(path: Path, doc_id: str, timestamp: str, config: ParseConfig) -> 
     try:
         from pypdf import PdfReader  # type: ignore[import-not-found]
     except ImportError as exc:
-        raise RuntimeError(
-            "PDF 파싱을 위해 `pdfplumber` 또는 `pypdf`가 필요합니다. `pip install pdfplumber` 권장."
-        ) from exc
+        _maybe_install_docparse_deps()
+        try:
+            from pypdf import PdfReader  # type: ignore[import-not-found]
+        except ImportError as exc2:
+            raise RuntimeError(
+                "PDF 파싱을 위해 `pdfplumber` 또는 `pypdf`가 필요합니다. `pip install -r requirements-docparse.txt` 권장."
+            ) from exc2
 
     reader = PdfReader(str(path))
     offset = 0
@@ -191,7 +202,13 @@ def _parse_image_ocr(path: Path, doc_id: str, timestamp: str, config: ParseConfi
     try:
         from PIL import Image  # type: ignore[import-not-found]
     except ImportError as exc:
-        raise RuntimeError("이미지 OCR을 위해 `pillow`가 필요합니다. `pip install pillow` 후 재시도하세요.") from exc
+        _maybe_install_docparse_deps()
+        try:
+            from PIL import Image  # type: ignore[import-not-found]
+        except ImportError as exc2:
+            raise RuntimeError(
+                "이미지 OCR을 위해 `pillow`가 필요합니다. `pip install -r requirements-docparse.txt` 후 재시도하세요."
+            ) from exc2
 
     image = Image.open(path)
     text = _ocr_image_text(image=image, ocr_lang=config.ocr_lang)
@@ -216,9 +233,13 @@ def _ocr_image_text(image: object, ocr_lang: str) -> str:
     try:
         import pytesseract  # type: ignore[import-not-found]
     except ImportError as exc:
-        raise RuntimeError(
-            "OCR을 위해 `pytesseract`가 필요합니다. `pip install pytesseract` 후 재시도하세요."
-        ) from exc
+        _maybe_install_docparse_deps()
+        try:
+            import pytesseract  # type: ignore[import-not-found]
+        except ImportError as exc2:
+            raise RuntimeError(
+                "OCR을 위해 `pytesseract`가 필요합니다. `pip install -r requirements-docparse.txt` 후 재시도하세요."
+            ) from exc2
 
     text = pytesseract.image_to_string(image, lang=ocr_lang)
     return text or ""
@@ -261,3 +282,17 @@ def _append_sentences(
 def _split_sentences(text: str) -> List[str]:
     chunks = [part.strip() for part in _SENTENCE_SPLIT_RE.split(text) if part and part.strip()]
     return chunks if chunks else [text.strip()]
+
+
+def _maybe_install_docparse_deps() -> None:
+    from .bootstrap import auto_install_enabled, ensure_installed, requirements_path
+
+    if not auto_install_enabled():
+        return
+    req = requirements_path("requirements-docparse.txt")
+    ensure_installed(
+        requirements_files=[req] if req is not None else None,
+        packages=("pdfplumber", "pypdf", "pillow", "pytesseract"),
+        auto_install=True,
+        quiet=False,
+    )

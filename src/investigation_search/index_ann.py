@@ -135,13 +135,39 @@ def load_index(index_path: Path, meta_path: Path) -> ANNIndex:
     ids = np.asarray(meta["ids"], dtype=np.int64)
 
     if backend == "hnsw":
-        import hnswlib
+        try:
+            import hnswlib
+        except ImportError as exc:
+            from .bootstrap import auto_install_enabled, ensure_installed, requirements_path
+
+            if not auto_install_enabled():
+                raise
+            req = requirements_path("requirements-search.txt")
+            ensure_installed(
+                requirements_files=[req] if req is not None else None,
+                packages=("hnswlib",),
+                auto_install=True,
+            )
+            import hnswlib  # type: ignore[import-not-found]
 
         index = hnswlib.Index(space="cosine", dim=dim)
         index.load_index(str(index_path))
         return ANNIndex(backend=backend, dim=dim, ids=ids, index=index)
     if backend == "faiss":
-        import faiss
+        try:
+            import faiss
+        except ImportError as exc:
+            from .bootstrap import auto_install_enabled, ensure_installed
+
+            if not auto_install_enabled():
+                raise
+            # faiss is optional and platform-specific; try faiss-cpu as a fallback.
+            ensure_installed(
+                requirements_files=None,
+                packages=("faiss-cpu",),
+                auto_install=True,
+            )
+            import faiss  # type: ignore[import-not-found]
 
         index = faiss.read_index(str(index_path))
         return ANNIndex(backend=backend, dim=dim, ids=ids, index=index)

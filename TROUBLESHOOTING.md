@@ -5,6 +5,12 @@
 - `PYTHONPATH=src`가 필요합니다.
 - PowerShell: `$env:PYTHONPATH="src"`
 
+## 자동 설치(옵션)
+
+- CLI/TUI 실행 중 필요한 파이썬 패키지가 없으면 자동으로 설치하도록 할 수 있습니다.
+  - PowerShell: `$env:INVESTIGATION_SEARCH_AUTO_INSTALL="1"`
+  - 또는 CLI 플래그: `--auto-install`
+
 ## `sentence-transformers가 필요합니다...`
 
 - Dense 임베딩 경로를 사용 중입니다.
@@ -40,3 +46,20 @@
   - `InvestigationEngine(..., enable_web_fallback=False)`
   - 또는 검색 DSL로 `-source:web_snippet`
 
+## 웹 검색 격리(서브프로세스) 관련
+
+- 기본 웹 검색은 별도 파이썬 프로세스에서 수행됩니다(최소 격리).
+- 서브프로세스 실행이 제한된 환경이면 웹 fallback이 동작하지 않을 수 있습니다.
+  - 해결: `enable_web_sandbox=False` 또는 TUI에서 `--no-web-sandbox`
+
+## TUI 실행 실패 (`textual` 관련)
+
+- 설치: `pip install -r requirements-tui.txt`
+- 실행: `$env:PYTHONPATH="src"; python -m investigation_search tui --build-dir artifacts/build`
+
+## PDF publish 실패 (`fpdf2` / 폰트)
+
+- 설치: `pip install -r requirements-publish.txt`
+- 유니코드 폰트가 필요합니다(한국어 포함).
+  - Windows 예: `C:\\Windows\\Fonts\\malgun.ttf`
+- `library publish --format pdf --font-path ...`로 직접 지정할 수 있습니다.

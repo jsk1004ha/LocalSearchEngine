@@ -74,6 +74,7 @@
 - **웹 fallback (옵션)**
   - 로컬 근거가 부족할 때 DuckDuckGo 결과를 `web_snippet` 근거로 병합
   - DSL에서 `-source:web_snippet`로 외부 결과 제외 가능
+  - 기본적으로 웹 검색은 **별도 파이썬 프로세스(서브프로세스)**에서 수행(최소 격리). 강한 격리가 필요하면 VM/Docker/Windows Sandbox 권장
 
 ## 빠른 시작
 
@@ -124,6 +125,21 @@ PY
 
 - Python 3.11+
 
+### 권장 (requirements)
+
+이 저장소는 기능 단위로 `requirements-*.txt`를 제공합니다.
+
+```powershell
+# 전체 기능(검색 + 문서파서 + TUI + publish)
+pip install -r requirements.txt
+
+# 또는 필요한 것만:
+pip install -r requirements-search.txt     # 하이브리드 검색(embeddings/ANN) + core
+pip install -r requirements-docparse.txt   # PDF/표/OCR 파서
+pip install -r requirements-tui.txt        # TUI(Textual)
+pip install -r requirements-publish.txt    # PDF publish
+```
+
 ### 선택(기능별)
 
 - Dense 임베딩/ANN: `numpy`, `sentence-transformers`, `hnswlib` 또는 `faiss-cpu`
@@ -140,6 +156,24 @@ pip install -U pdfplumber pillow pytesseract
 ```
 
 ## 사용법
+
+### 0) CLI/TUI
+
+패키지 설치 없이 실행할 때는 `PYTHONPATH=src`가 필요합니다.
+
+```powershell
+$env:PYTHONPATH="src"
+$env:INVESTIGATION_SEARCH_AUTO_INSTALL="1"  # (옵션) 필요한 파이썬 의존성 자동 설치
+
+# TUI 실행 (오프라인 빌드 사용 권장)
+python -m investigation_search tui --build-dir artifacts/build --enable-knowledge-library
+
+# 지식도서관 보기용 HTML export
+python -m investigation_search library export --out-dir artifacts/library_export --format html
+
+# 지식도서관 publish(zip)
+python -m investigation_search library publish --out artifacts/library_bundle.zip --format zip
+```
 
 ### 1) 오프라인 빌드
 
@@ -225,6 +259,39 @@ result = engine.search("주제", mode="reporter")
 - `artifacts/knowledge_library/evidence/web_snippets.jsonl`: 웹 스니펫 근거(있을 때)
 - (옵션) `artifacts/knowledge_library/osint/<session_id>.json`: OSINT 아티팩트(모드에 따라)
 
+### 보기(Export)
+
+지식도서관은 JSON이지만, 보기 쉽게 **HTML/Markdown으로 export**할 수 있습니다.
+
+```powershell
+$env:PYTHONPATH="src"
+
+# HTML export (브라우저로 index.html 열기)
+python -m investigation_search library export --out-dir artifacts/library_export --format html
+
+# (옵션) 로컬 HTTP 서버로 보기
+python -m investigation_search library serve --dir artifacts/library_export --port 8765
+
+# Markdown export
+python -m investigation_search library export --out-dir artifacts/library_md --format md
+```
+
+### Publish
+
+공유/보관 용도로 zip(정적 HTML/MD + raw JSON)을 생성할 수 있습니다.
+
+```powershell
+$env:PYTHONPATH="src"
+python -m investigation_search library publish --out artifacts/library_bundle.zip --format zip
+```
+
+PDF publish는 선택 기능이며 `fpdf2`와 유니코드 폰트가 필요합니다.
+
+```powershell
+pip install -r requirements-publish.txt
+python -m investigation_search library publish --out artifacts/library.pdf --format pdf --max-sessions 30
+```
+
 ## 설정
 
 엔진 생성 시 주로 쓰는 옵션:
@@ -251,9 +318,17 @@ engine.delete_user_search_data(delete_learning_state_file=True)
 engine.delete_user_search_data(delete_learning_state_file=True, delete_knowledge_library=True)
 ```
 
+- CLI에서 지식도서관 전체 삭제:
+
+```powershell
+$env:PYTHONPATH="src"
+python -m investigation_search library delete --yes
+```
+
 - 웹 fallback은 외부로 쿼리를 전송합니다. 개인정보가 민감하면:
   - `enable_web_fallback=False` 또는
   - DSL로 `-source:web_snippet` 사용
+  - (옵션) 웹 fallback 격리 해제: `enable_web_sandbox=False` 또는 TUI에서 `--no-web-sandbox`
 
 ## 문제 해결
 

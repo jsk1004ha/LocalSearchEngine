@@ -1,0 +1,4 @@
+# Optional Korean morphology (Konlpy / Okt). Requires Java + JPype runtime.
+konlpy>=0.6.0
+jpype1>=1.5.0
+
