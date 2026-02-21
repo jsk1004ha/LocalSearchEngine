@@ -1,6 +1,7 @@
 from .embedding import DEFAULT_EMBEDDING_MODEL, encode_texts, load_local_model
 from .engine import InvestigationEngine
 from .index_ann import build_index, load_index, save_index, search_index
+from .reranker import LocalCrossEncoderReranker, OnnxRerankerAdapter
 from .offline import build_manifest, knowledge_build_id, load_build, write_build
 from .schema import EvidenceUnit, ScoredEvidence, SearchResult, SourceType, Verdict
 
@@ -17,6 +18,8 @@ __all__ = [
     "DEFAULT_EMBEDDING_MODEL",
     "load_local_model",
     "encode_texts",
+    "LocalCrossEncoderReranker",
+    "OnnxRerankerAdapter",
     "EvidenceUnit",
     "ScoredEvidence",
     "SearchResult",
