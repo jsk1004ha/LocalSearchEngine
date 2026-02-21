@@ -10,7 +10,7 @@ from .bootstrap import AUTO_INSTALL_ENV, auto_install_enabled, ensure_installed,
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="investigation_search", description="Local Investigation Search Engine tools")
+    parser = argparse.ArgumentParser(prog="investigation_search", description="Investigation Search Engine tools (web-first + optional local corpus)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_tui = sub.add_parser("tui", help="Run terminal UI (Textual)")
@@ -21,8 +21,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_tui.add_argument("--time-budget", type=int, default=120, help="time budget sec")
     p_tui.add_argument("--knowledge-library-dir", type=str, default=str(Path("artifacts") / "knowledge_library"))
     p_tui.add_argument("--enable-knowledge-library", action="store_true", help="persist searches to knowledge library")
-    p_tui.add_argument("--no-web", action="store_true", help="disable web fallback")
+    p_tui.add_argument("--no-web", action="store_true", help="disable web search")
     p_tui.add_argument("--no-web-sandbox", action="store_true", help="disable subprocess isolation for web search")
+    p_tui.add_argument("--web-only", action="store_true", help="web search only (no local corpus/build)")
+    p_tui.add_argument("--web-fetch", action="store_true", help="fetch and parse result pages (HTML/PDF) to create richer evidence")
+    p_tui.add_argument("--web-fetch-pages", type=int, default=4, help="max pages to fetch per query")
     p_tui.add_argument(
         "--auto-install",
         action="store_true",
@@ -221,6 +224,25 @@ def _load_engine_for_tui(args: argparse.Namespace):
     library_dir = getattr(args, "knowledge_library_dir", str(Path("artifacts") / "knowledge_library"))
     enable_web = not bool(getattr(args, "no_web", False))
     enable_web_sandbox = not bool(getattr(args, "no_web_sandbox", False))
+    web_only = bool(getattr(args, "web_only", False))
+    enable_web_fetch = bool(getattr(args, "web_fetch", False))
+    web_fetch_pages = int(getattr(args, "web_fetch_pages", 4) or 0)
+
+    if web_only:
+        if args.build_dir or (args.docs or []):
+            raise SystemExit("--web-only cannot be combined with --build-dir/--docs")
+        if not enable_web:
+            raise SystemExit("--web-only requires web fallback (remove --no-web)")
+        return InvestigationEngine(
+            [],
+            enable_cache=True,
+            enable_web_fallback=True,
+            enable_web_sandbox=enable_web_sandbox,
+            enable_web_fetch=enable_web_fetch,
+            web_fetch_max_pages=web_fetch_pages,
+            enable_knowledge_library=enable_library,
+            knowledge_library_dir=Path(library_dir),
+        )
 
     if args.build_dir:
         engine = _load_engine_from_build(
@@ -229,12 +251,26 @@ def _load_engine_for_tui(args: argparse.Namespace):
             knowledge_library_dir=library_dir,
             enable_web_fallback=enable_web,
             enable_web_sandbox=enable_web_sandbox,
+            enable_web_fetch=enable_web_fetch,
+            web_fetch_max_pages=web_fetch_pages,
         )
         return engine
 
     docs = args.docs or []
     if not docs:
-        raise SystemExit("tui requires --build-dir or --docs")
+        # Web-first default: if no local corpus was provided, fall back to web-only engine.
+        if not enable_web:
+            raise SystemExit("tui requires --build-dir/--docs, or web search enabled (remove --no-web)")
+        return InvestigationEngine(
+            [],
+            enable_cache=True,
+            enable_web_fallback=True,
+            enable_web_sandbox=enable_web_sandbox,
+            enable_web_fetch=enable_web_fetch,
+            web_fetch_max_pages=web_fetch_pages,
+            enable_knowledge_library=enable_library,
+            knowledge_library_dir=Path(library_dir),
+        )
     from .parser import DocumentParser, parse_documents
 
     units = parse_documents(docs, parser=DocumentParser())
@@ -243,6 +279,8 @@ def _load_engine_for_tui(args: argparse.Namespace):
         enable_cache=True,
         enable_web_fallback=enable_web,
         enable_web_sandbox=enable_web_sandbox,
+        enable_web_fetch=enable_web_fetch,
+        web_fetch_max_pages=web_fetch_pages,
         enable_knowledge_library=enable_library,
         knowledge_library_dir=Path(library_dir),
     )
@@ -255,6 +293,8 @@ def _load_engine_from_build(
     knowledge_library_dir: str | Path,
     enable_web_fallback: bool,
     enable_web_sandbox: bool,
+    enable_web_fetch: bool,
+    web_fetch_max_pages: int,
 ) :
     from .engine import InvestigationEngine
     from .index_ann import load_index
@@ -295,6 +335,8 @@ def _load_engine_from_build(
             embedding_model=embedding_model,
             enable_web_fallback=enable_web_fallback,
             enable_web_sandbox=enable_web_sandbox,
+            enable_web_fetch=enable_web_fetch,
+            web_fetch_max_pages=web_fetch_max_pages,
             enable_knowledge_library=enable_knowledge_library,
             knowledge_library_dir=Path(knowledge_library_dir),
         )
@@ -317,6 +359,8 @@ def _load_engine_from_build(
         embedding_model=embedding_model,
         enable_web_fallback=enable_web_fallback,
         enable_web_sandbox=enable_web_sandbox,
+        enable_web_fetch=enable_web_fetch,
+        web_fetch_max_pages=web_fetch_max_pages,
         enable_knowledge_library=enable_knowledge_library,
         knowledge_library_dir=Path(knowledge_library_dir),
     )

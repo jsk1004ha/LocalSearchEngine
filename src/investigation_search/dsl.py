@@ -20,6 +20,12 @@ _SOURCE_ALIASES = {
     "caption": SourceType.CAPTION,
     "ocr": SourceType.OCR_TEXT,
     "ocr_text": SourceType.OCR_TEXT,
+    "web": SourceType.WEB_SNIPPET,
+    "snippet": SourceType.WEB_SNIPPET,
+    "web_snippet": SourceType.WEB_SNIPPET,
+    "page": SourceType.WEB_PAGE_TEXT,
+    "web_page": SourceType.WEB_PAGE_TEXT,
+    "web_page_text": SourceType.WEB_PAGE_TEXT,
 }
 
 

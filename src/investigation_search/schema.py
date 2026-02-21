@@ -11,6 +11,7 @@ class SourceType(str, Enum):
     CAPTION = "caption"
     OCR_TEXT = "ocr_text"
     WEB_SNIPPET = "web_snippet"
+    WEB_PAGE_TEXT = "web_page_text"
 
 
 @dataclass(frozen=True)

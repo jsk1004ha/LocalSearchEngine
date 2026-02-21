@@ -42,6 +42,13 @@ from .schema import (
 )
 from .viewer import highlight_text, render_result_text, summarize_stage_scores
 from .websearch import DuckDuckGoSearchProvider, SubprocessSandboxWebSearchProvider, WebSearchProvider, WebSearchResult
+from .webfetch import (
+    SubprocessSandboxWebFetchProvider,
+    StdlibWebFetchProvider,
+    WebFetchProvider,
+    WebFetchedPage,
+    chunk_text,
+)
 from .publisher import publish_knowledge_library_pdf, publish_knowledge_library_zip
 
 __all__ = [
@@ -122,6 +129,11 @@ __all__ = [
     "WebSearchResult",
     "DuckDuckGoSearchProvider",
     "SubprocessSandboxWebSearchProvider",
+    "WebFetchProvider",
+    "WebFetchedPage",
+    "StdlibWebFetchProvider",
+    "SubprocessSandboxWebFetchProvider",
+    "chunk_text",
     "SourceType",
     "Verdict",
     "publish_knowledge_library_zip",

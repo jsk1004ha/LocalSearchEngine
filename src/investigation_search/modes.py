@@ -29,6 +29,8 @@ class ModeProfile:
     enable_web_fallback: bool
     web_max_results: int
     web_score_base: float
+    enable_web_fetch: bool
+    web_fetch_max_pages: int
     retrieval_options_overrides: Mapping[str, object]
     include_only_trusted_sources: bool = False
 
@@ -86,6 +88,8 @@ def profile_for_mode(mode: SearchMode) -> ModeProfile:
             enable_web_fallback=False,
             web_max_results=0,
             web_score_base=0.0,
+            enable_web_fetch=False,
+            web_fetch_max_pages=0,
             retrieval_options_overrides={},
         )
 
@@ -99,6 +103,8 @@ def profile_for_mode(mode: SearchMode) -> ModeProfile:
             enable_web_fallback=True,
             web_max_results=6,
             web_score_base=0.55,
+            enable_web_fetch=True,
+            web_fetch_max_pages=4,
             retrieval_options_overrides={"enable_recency_boost": True},
         )
 
@@ -112,6 +118,8 @@ def profile_for_mode(mode: SearchMode) -> ModeProfile:
             enable_web_fallback=True,
             web_max_results=10,
             web_score_base=0.65,
+            enable_web_fetch=True,
+            web_fetch_max_pages=6,
             retrieval_options_overrides={"enable_recency_boost": True},
         )
 
@@ -125,6 +133,8 @@ def profile_for_mode(mode: SearchMode) -> ModeProfile:
             enable_web_fallback=True,
             web_max_results=12,
             web_score_base=0.6,
+            enable_web_fetch=True,
+            web_fetch_max_pages=5,
             retrieval_options_overrides={},
         )
 
@@ -138,6 +148,8 @@ def profile_for_mode(mode: SearchMode) -> ModeProfile:
             enable_web_fallback=True,
             web_max_results=10,
             web_score_base=0.5,
+            enable_web_fetch=True,
+            web_fetch_max_pages=4,
             retrieval_options_overrides={},
         )
 
@@ -152,6 +164,8 @@ def profile_for_mode(mode: SearchMode) -> ModeProfile:
             enable_web_fallback=False,
             web_max_results=0,
             web_score_base=0.0,
+            enable_web_fetch=False,
+            web_fetch_max_pages=0,
             retrieval_options_overrides={"min_ocr_confidence": 0.55},
             include_only_trusted_sources=True,
         )
@@ -165,6 +179,8 @@ def profile_for_mode(mode: SearchMode) -> ModeProfile:
         enable_web_fallback=True,
         web_max_results=3,
         web_score_base=0.25,
+        enable_web_fetch=True,
+        web_fetch_max_pages=2,
         retrieval_options_overrides={},
     )
 

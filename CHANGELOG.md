@@ -5,6 +5,8 @@ This project uses `VERSION` as the single source of truth.
 ## 0.9.0
 
 - Auto-install bootstrap + web search subprocess isolation
+- Multi-pass web search integrated into ranking pipeline (web-only supported)
+- Optional web page fetch/parsing (`web_page_text`) for richer evidence
 
 ## 0.8.0
 

@@ -10,11 +10,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 from typing import Dict, Iterable, List, Optional, Sequence
 
-from .bm25 import BM25Index
+from .bm25 import BM25Index, build_bm25_index
 from .contradiction import ContradictionDetector, HeuristicContradictionDetector
 from .dsl import ParsedSearchQuery, SearchFilters, apply_search_filters, filter_to_dict, parse_search_query
-from .embedding import DEFAULT_EMBEDDING_MODEL
-from .index_ann import ANNIndex
+from .embedding import DEFAULT_EMBEDDING_MODEL, encode_texts
+from .index_ann import ANNIndex, build_index
 from .library import KnowledgeLibrary
 from .learning import LearningConfig, OnlineLearningManager
 from .modes import SearchMode, build_passes_for_mode, parse_mode, profile_for_mode
@@ -30,7 +30,14 @@ from .retrieval import (
 )
 from .schema import EvidenceUnit, ScoredEvidence, SearchResult, SourceCitation, SourceType, Verdict, build_source_citation
 from .viewer import summarize_stage_scores
-from .websearch import DuckDuckGoSearchProvider, SubprocessSandboxWebSearchProvider, WebSearchProvider
+from .webfetch import (
+    StdlibWebFetchProvider,
+    SubprocessSandboxWebFetchProvider,
+    WebFetchProvider,
+    WebFetchedPage,
+    chunk_text,
+)
+from .websearch import DuckDuckGoSearchProvider, SubprocessSandboxWebSearchProvider, WebSearchProvider, WebSearchResult
 
 
 @dataclass(frozen=True)
@@ -79,6 +86,13 @@ class InvestigationEngine:
         enable_web_sandbox: bool = True,
         web_sandbox_timeout_sec: float = 14.0,
         web_sandbox_max_bytes: int = 1_500_000,
+        enable_web_fetch: bool = False,
+        web_fetch_max_pages: int = 4,
+        web_fetch_provider: WebFetchProvider | None = None,
+        web_fetch_timeout_sec: float = 12.0,
+        web_fetch_max_bytes: int = 2_500_000,
+        web_fetch_max_text_chars: int = 180_000,
+        web_fetch_allow_pdf: bool = True,
         enable_knowledge_library: bool = False,
         knowledge_library_dir: str | Path = Path("artifacts") / "knowledge_library",
         trusted_domains: Sequence[str] | None = None,
@@ -111,6 +125,25 @@ class InvestigationEngine:
                 self.web_search_provider = DuckDuckGoSearchProvider(
                     timeout_sec=max(1.0, float(web_sandbox_timeout_sec)),
                     max_bytes=max(0, int(web_sandbox_max_bytes)),
+                )
+        self.enable_web_fetch = bool(enable_web_fetch)
+        self.web_fetch_max_pages = max(0, int(web_fetch_max_pages))
+        if web_fetch_provider is not None:
+            self.web_fetch_provider = web_fetch_provider
+        else:
+            if enable_web_sandbox:
+                self.web_fetch_provider = SubprocessSandboxWebFetchProvider(
+                    timeout_sec=max(1.0, float(web_fetch_timeout_sec)),
+                    max_bytes=max(0, int(web_fetch_max_bytes)),
+                    max_text_chars=max(0, int(web_fetch_max_text_chars)),
+                    allow_pdf=bool(web_fetch_allow_pdf),
+                )
+            else:
+                self.web_fetch_provider = StdlibWebFetchProvider(
+                    timeout_sec=max(1.0, float(web_fetch_timeout_sec)),
+                    max_bytes=max(0, int(web_fetch_max_bytes)),
+                    max_text_chars=max(0, int(web_fetch_max_text_chars)),
+                    allow_pdf=bool(web_fetch_allow_pdf),
                 )
         self.trusted_domains = {d.strip().lower() for d in (trusted_domains or []) if str(d).strip()}
         self._library = KnowledgeLibrary(knowledge_library_dir) if enable_knowledge_library else None
@@ -202,7 +235,8 @@ class InvestigationEngine:
             "rrf": active_weights.rrf,
         }
 
-        for qp in build_passes_for_mode(query_text, mode_enum):
+        passes = tuple(build_passes_for_mode(query_text, mode_enum))
+        for qp in passes:
             elapsed = time.time() - start
             remaining = time_budget_sec - elapsed
             if remaining <= 0:
@@ -224,6 +258,52 @@ class InvestigationEngine:
             pass_stats[qp.name] = {"hits": len(hits), "shards": shard_hits}
 
         selected = self._dedupe_candidates(selected)
+
+        enable_web = self.enable_web_fallback and profile.enable_web_fallback
+        web_meta: dict[str, object] = {
+            "enabled": enable_web,
+            "provider": getattr(self.web_search_provider, "provider_name", None),
+            "used": False,
+            "reason": None,
+            "result_count": 0,
+        }
+        web_rows: list[WebSearchResult] = []
+
+        should_web_search = profile.always_web_search or (len(selected) < self.web_fallback_min_local_hits)
+        if enable_web and should_web_search:
+            if self._web_allowed_by_filters(parsed_query.filters):
+                web_hits, web_meta, web_rows = self._web_fallback(
+                    query_text,
+                    passes=passes,
+                    filters=parsed_query.filters,
+                    web_meta=web_meta,
+                    score_base=profile.web_score_base,
+                    max_results=profile.web_max_results,
+                    top_k=effective_top_k,
+                    weights=active_weights,
+                    token_boosts=active_token_boosts,
+                    retrieval_options=effective_retrieval_options,
+                    enable_web_fetch=bool(self.enable_web_fetch and profile.enable_web_fetch),
+                    web_fetch_max_pages=min(self.web_fetch_max_pages, int(profile.web_fetch_max_pages)),
+                )
+                if web_hits:
+                    selected.extend(web_hits)
+                    selected = self._dedupe_candidates(selected)
+                if mode_enum in {SearchMode.FBI, SearchMode.COLLECTION} and web_rows:
+                    pass_stats.setdefault("osint", {})
+                    pass_stats["osint"]["web_results"] = [
+                        {"rank": row.rank, "title": row.title, "url": row.url, "snippet": row.snippet}
+                        for row in web_rows
+                    ]
+                    if mode_enum == SearchMode.FBI:
+                        pass_stats["osint"]["graph"] = build_osint_graph(query_text, web_rows)
+                        pass_stats["osint"]["timeline"] = extract_timeline(web_rows, limit=30)
+            else:
+                web_meta["reason"] = "filtered_out_by_query_dsl"
+        elif enable_web:
+            web_meta["reason"] = "enough_local_hits"
+        else:
+            web_meta["reason"] = "disabled"
 
         rerank_budget_sec = 0.015 * max(len(selected), 1)
         rerank_meta: Dict[str, object] = {
@@ -282,53 +362,19 @@ class InvestigationEngine:
         if not contradictions and best:
             pass_stats["disconfirming_check"] = "insufficient_contradicting_evidence"
 
-        enable_web = self.enable_web_fallback and profile.enable_web_fallback
-        web_meta: dict[str, object] = {
-            "enabled": enable_web,
-            "provider": getattr(self.web_search_provider, "provider_name", None),
-            "used": False,
-            "reason": None,
-            "result_count": 0,
-        }
-        should_web_search = profile.always_web_search or (len(best) < self.web_fallback_min_local_hits)
-        if enable_web and should_web_search:
-            if self._web_allowed_by_filters(parsed_query.filters):
-                web_hits, web_meta, web_rows = self._web_fallback(
-                    query_text,
-                    web_meta=web_meta,
-                    score_base=profile.web_score_base,
-                    max_results=profile.web_max_results,
-                )
-                if web_hits:
-                    best = self._merge_with_web(best, web_hits, top_n=max(effective_top_k, 3))
-                    contradictions = [s for s in best if s.verdict == Verdict.CONTRADICTS]
-                    supports = [s for s in best if s.verdict == Verdict.SUPPORTS]
-                    if supports:
-                        answer = supports[0].evidence.content
-                        answer_source = supports[0].source or build_source_citation(supports[0].evidence)
-                    elif best:
-                        answer = best[0].evidence.content
-                        answer_source = best[0].source or build_source_citation(best[0].evidence)
-                if mode_enum in {SearchMode.FBI, SearchMode.COLLECTION} and web_rows:
-                    pass_stats.setdefault("osint", {})
-                    pass_stats["osint"]["web_results"] = [
-                        {"rank": row.rank, "title": row.title, "url": row.url, "snippet": row.snippet}
-                        for row in web_rows
-                    ]
-                    if mode_enum == SearchMode.FBI:
-                        pass_stats["osint"]["graph"] = build_osint_graph(query_text, web_rows)
-                        pass_stats["osint"]["timeline"] = extract_timeline(web_rows, limit=30)
-            else:
-                web_meta["reason"] = "filtered_out_by_query_dsl"
-        elif enable_web:
-            web_meta["reason"] = "enough_local_hits"
-        else:
-            web_meta["reason"] = "disabled"
-
         if profile.include_only_trusted_sources:
             best = self._filter_trusted(best)
             contradictions = [s for s in best if s.verdict == Verdict.CONTRADICTS]
             supports = [s for s in best if s.verdict == Verdict.SUPPORTS]
+            if supports:
+                answer = supports[0].evidence.content
+                answer_source = supports[0].source or build_source_citation(supports[0].evidence)
+            elif best:
+                answer = best[0].evidence.content
+                answer_source = best[0].source or build_source_citation(best[0].evidence)
+            else:
+                answer = "근거를 찾지 못했습니다."
+                answer_source = None
 
         sources = self._collect_sources(best)
         if answer_source is not None:
@@ -597,7 +643,8 @@ class InvestigationEngine:
         payload = (
             f"{self.build_id}|{self.embedding_model}|{self.shard_count}|"
             f"{top_k_per_pass}|{time_budget_sec}|{len(self.evidence_units)}|"
-            f"{learning_bucket}|{int(self.enable_web_fallback)}|{mode}|{query.strip().lower()}"
+            f"{learning_bucket}|{int(self.enable_web_fallback)}|{int(self.enable_web_fetch)}|{self.web_fetch_max_pages}|"
+            f"{mode}|{query.strip().lower()}"
         )
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
@@ -726,9 +773,13 @@ class InvestigationEngine:
         return parse_search_query(query)
 
     def _web_allowed_by_filters(self, filters: SearchFilters) -> bool:
-        if filters.include_source_types and SourceType.WEB_SNIPPET not in filters.include_source_types:
+        web_types = {SourceType.WEB_SNIPPET, SourceType.WEB_PAGE_TEXT}
+        if filters.include_source_types and not (filters.include_source_types & web_types):
             return False
-        if SourceType.WEB_SNIPPET in filters.exclude_source_types:
+        if web_types.issubset(filters.exclude_source_types):
+            return False
+        # If user is scoping search tightly to local sections, skip web to avoid noisy results.
+        if filters.section_prefixes:
             return False
         return True
 
@@ -736,58 +787,238 @@ class InvestigationEngine:
         self,
         query: str,
         *,
+        passes: Sequence[QueryPass],
+        filters: SearchFilters,
         web_meta: Dict[str, object],
         score_base: float,
         max_results: int,
+        top_k: int,
+        weights: RetrievalWeights,
+        token_boosts: Dict[str, float],
+        retrieval_options: RetrievalOptions,
+        enable_web_fetch: bool,
+        web_fetch_max_pages: int,
     ):
         provider = self.web_search_provider
-        try:
-            rows = provider.search(query, max_results=max(1, int(max_results)))
-        except Exception as exc:
-            updated = dict(web_meta)
-            updated["reason"] = f"error:{type(exc).__name__}"
-            return [], updated, []
+        pass_summaries: list[dict[str, object]] = []
+
+        max_results = max(1, int(max_results))
+        # Always do multi-pass web search to preserve "contradiction/boundary" discovery semantics.
+        seen_by_url: dict[str, WebSearchResult] = {}
+        url_passes: dict[str, set[str]] = defaultdict(set)
+        had_error = False
+
+        for qp in passes:
+            try:
+                rows = provider.search(qp.query, max_results=max_results)
+            except Exception as exc:
+                had_error = True
+                pass_summaries.append({"pass": qp.name, "query": qp.query, "error": f"{type(exc).__name__}"})
+                continue
+            pass_summaries.append({"pass": qp.name, "query": qp.query, "result_count": len(rows)})
+            for row in rows:
+                url = str(row.url or "").strip()
+                if not url:
+                    continue
+                url_passes[url].add(qp.name)
+                prev = seen_by_url.get(url)
+                if prev is None or int(row.rank) < int(prev.rank):
+                    seen_by_url[url] = row
+
+        web_rows = sorted(seen_by_url.values(), key=lambda r: (int(r.rank), str(r.url)))
+        max_unique = max_results * max(len(passes), 1)
+        web_rows = web_rows[:max_unique]
 
         now_iso = datetime.now(timezone.utc).isoformat()
-        hits: list[ScoredEvidence] = []
-        for rank, row in enumerate(rows, start=1):
-            content = row.snippet.strip() or row.title.strip()
+        web_units: list[EvidenceUnit] = []
+        for row in web_rows:
+            content = (row.snippet or "").strip() or (row.title or "").strip()
             if not content:
                 continue
+            url = str(row.url or "").strip()
             unit = EvidenceUnit(
-                doc_id=row.url,
+                doc_id=url,
                 source_type=SourceType.WEB_SNIPPET,
                 content=content,
-                section_path=row.title.strip()[:120] or "web",
+                section_path=(row.title or "").strip()[:120] or "web",
                 char_start=0,
                 char_end=len(content),
                 timestamp=now_iso,
                 confidence=0.62,
                 metadata={
                     "provider": row.provider,
-                    "url": row.url,
+                    "url": url,
                     "title": row.title,
-                    "web_rank": rank,
+                    "web_rank": int(row.rank),
+                    "web_passes": sorted(url_passes.get(url, set())),
                 },
             )
-            base = max(0.0, min(float(score_base), 1.0))
-            score = max(0.0, base - (rank - 1) * 0.06)
-            hits.append(
-                ScoredEvidence(
-                    evidence=unit,
-                    score=score,
-                    verdict=Verdict.UNCERTAIN,
-                    why_it_matches=f"web_fallback:{row.provider}:rank={rank}",
-                    stage_scores={"web_fallback": score, "web_rank": float(rank)},
-                    source=build_source_citation(unit),
+            web_units.append(unit)
+
+        fetch_meta: dict[str, object] = {"enabled": bool(enable_web_fetch), "used": False, "page_count": 0, "unit_count": 0}
+        want_page_text = True
+        if SourceType.WEB_PAGE_TEXT in filters.exclude_source_types:
+            want_page_text = False
+        if filters.include_source_types and SourceType.WEB_PAGE_TEXT not in filters.include_source_types:
+            want_page_text = False
+
+        page_units: list[EvidenceUnit] = []
+        if enable_web_fetch and want_page_text and web_rows and web_fetch_max_pages > 0:
+            urls = [str(row.url or "").strip() for row in web_rows]
+            urls = [u for u in urls if u]
+            urls = urls[: max(0, int(web_fetch_max_pages))]
+            try:
+                pages = self.web_fetch_provider.fetch(urls, max_pages=len(urls))
+                fetch_meta["used"] = True
+                fetch_meta["page_count"] = len(pages)
+                # Convert pages -> EvidenceUnits
+                max_chunks_per_page = 10
+                for page in pages:
+                    if not page.ok:
+                        continue
+                    base_url = (page.final_url or page.url or "").strip()
+                    if not base_url:
+                        continue
+                    base_row = seen_by_url.get(page.url) or seen_by_url.get(base_url)
+                    rank = int(getattr(base_row, "rank", 0) or 0) if base_row is not None else 0
+                    passes_for_url = sorted(url_passes.get(page.url, set()) | url_passes.get(base_url, set()))
+
+                    chunks = chunk_text(page.text, max_chars=900, overlap=120, min_chars=160)
+                    if not chunks:
+                        continue
+                    title = (page.title or (base_row.title if base_row is not None else "") or "").strip()
+                    section_base = title[:90] if title else "web_page"
+
+                    for idx, (chunk, start_off, end_off) in enumerate(chunks[:max_chunks_per_page], start=1):
+                        page_units.append(
+                            EvidenceUnit(
+                                doc_id=base_url,
+                                source_type=SourceType.WEB_PAGE_TEXT,
+                                content=chunk,
+                                section_path=f"{section_base}#chunk{idx}",
+                                char_start=int(start_off),
+                                char_end=int(end_off),
+                                timestamp=now_iso,
+                                confidence=0.6,
+                                metadata={
+                                    "provider": getattr(self.web_search_provider, "provider_name", None),
+                                    "fetch_provider": getattr(self.web_fetch_provider, "provider_name", None),
+                                    "url": base_url,
+                                    "title": title,
+                                    "status": page.status,
+                                    "content_type": page.content_type,
+                                    "web_rank": rank,
+                                    "web_passes": passes_for_url,
+                                },
+                            )
+                        )
+                fetch_meta["unit_count"] = len(page_units)
+            except Exception as exc:
+                fetch_meta["used"] = False
+                fetch_meta["error"] = f"{type(exc).__name__}"
+
+        if page_units:
+            web_units.extend(page_units)
+
+        web_units = apply_search_filters(web_units, filters)
+        if not web_units:
+            updated = dict(web_meta)
+            updated["used"] = False
+            updated["result_count"] = len(web_rows)
+            updated["reason"] = "no_results" if not web_rows else "filtered_out_by_query_dsl"
+            updated["passes"] = pass_summaries
+            updated["web_fetch"] = fetch_meta
+            return [], updated, web_rows
+
+        bm25_index = build_bm25_index([u.content for u in web_units])
+
+        ann_index: ANNIndex | None = None
+        dense_meta: dict[str, object] = {"enabled": False, "reason": "disabled"}
+        try:
+            import numpy as np  # type: ignore
+
+            if hasattr(np, "linalg") and callable(getattr(np.linalg, "norm", None)):
+                vectors = encode_texts([u.content for u in web_units], model_name=self.embedding_model, text_type="passage")
+                ann_index = build_index(vectors, backend="exact")
+                dense_meta = {"enabled": True, "backend": "exact", "dim": int(getattr(ann_index, "dim", 0))}
+        except Exception as exc:  # pragma: no cover - optional path
+            ann_index = None
+            dense_meta = {"enabled": False, "reason": f"error:{type(exc).__name__}"}
+
+        hits: list[ScoredEvidence] = []
+        for qp in passes:
+            hits.extend(
+                retrieve(
+                    qp,
+                    web_units,
+                    top_k=top_k,
+                    bm25_index=bm25_index,
+                    ann_index=ann_index,
+                    embedding_model=self.embedding_model,
+                    weights=weights,
+                    token_boosts=token_boosts,
+                    options=retrieval_options,
                 )
             )
 
+        adjusted: list[ScoredEvidence] = []
+        for item in hits:
+            rank = int(item.evidence.metadata.get("web_rank") or 0) or 999
+            rank_prior = max(0.55, 1.0 - (rank - 1) * 0.05)
+            raw_score = float(item.score)
+            final_score = raw_score * rank_prior
+            stage = dict(item.stage_scores)
+            stage.setdefault("hybrid_raw", float(stage.get("hybrid", raw_score)))
+            stage["web_rank"] = float(rank)
+            stage["web_rank_prior"] = float(rank_prior)
+            stage["hybrid"] = final_score
+            adjusted.append(
+                ScoredEvidence(
+                    evidence=item.evidence,
+                    score=final_score,
+                    verdict=item.verdict,
+                    why_it_matches=f"{item.why_it_matches}, web_rank={rank}",
+                    stage_scores=stage,
+                    source=item.source or build_source_citation(item.evidence),
+                )
+            )
+
+        if not adjusted and web_units:
+            # If hybrid scoring yields nothing (e.g., query language mismatch), still surface web results
+            # using provider rank-based priors so users can see external evidence exists.
+            fallback_hits: list[ScoredEvidence] = []
+            base = max(0.0, min(float(score_base), 1.0))
+            for unit in web_units:
+                rank = int(unit.metadata.get("web_rank") or 0) or 999
+                score = max(0.0, base - (rank - 1) * 0.06)
+                fallback_hits.append(
+                    ScoredEvidence(
+                        evidence=unit,
+                        score=score,
+                        verdict=Verdict.UNCERTAIN,
+                        why_it_matches=f"web_fallback:{unit.metadata.get('provider')}:rank={rank}",
+                        stage_scores={"web_fallback": score, "web_rank": float(rank)},
+                        source=build_source_citation(unit),
+                    )
+                )
+            adjusted = fallback_hits
+
         updated = dict(web_meta)
-        updated["used"] = bool(hits)
-        updated["result_count"] = len(hits)
-        updated["reason"] = "applied" if hits else "no_results"
-        return hits, updated, rows
+        updated["used"] = bool(web_rows)
+        updated["result_count"] = len(web_rows)
+        updated["unit_count"] = len(web_units)
+        updated["candidate_count"] = len(adjusted)
+        updated["passes"] = pass_summaries
+        updated["dense_index"] = dense_meta
+        updated["web_fetch"] = fetch_meta
+        if adjusted:
+            updated["reason"] = "applied"
+        elif had_error:
+            updated["reason"] = "error"
+        else:
+            updated["reason"] = "no_results"
+
+        return adjusted, updated, web_rows
 
     def _merge_with_web(
         self,
@@ -843,11 +1074,15 @@ class InvestigationEngine:
 
     def _filter_trusted(self, items: Sequence[ScoredEvidence]) -> List[ScoredEvidence]:
         if not self.trusted_domains:
-            return [item for item in items if item.evidence.source_type != SourceType.WEB_SNIPPET]
+            return [
+                item
+                for item in items
+                if item.evidence.source_type not in {SourceType.WEB_SNIPPET, SourceType.WEB_PAGE_TEXT}
+            ]
 
         trusted: list[ScoredEvidence] = []
         for item in items:
-            if item.evidence.source_type != SourceType.WEB_SNIPPET:
+            if item.evidence.source_type not in {SourceType.WEB_SNIPPET, SourceType.WEB_PAGE_TEXT}:
                 trusted.append(item)
                 continue
             url = str(item.evidence.metadata.get("url") or item.evidence.doc_id)
@@ -881,6 +1116,13 @@ class InvestigationEngine:
         ]
         if web_units:
             self._library.append_evidence_units(web_units, tag="web_snippets")
+        web_pages = [
+            item.evidence
+            for item in [*result.evidence, *result.contradictions]
+            if item.evidence.source_type == SourceType.WEB_PAGE_TEXT
+        ]
+        if web_pages:
+            self._library.append_evidence_units(web_pages, tag="web_pages")
         if "osint" in result.diagnostics and isinstance(result.diagnostics.get("osint"), dict):
             self._library.save_osint_artifacts(session_id, artifacts=result.diagnostics["osint"])
         return session_id

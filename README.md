@@ -1,16 +1,17 @@
-# Local Investigation Search Engine
+# Web Investigation Search Engine
 
-로컬 PC 환경에서 돌아가는 **조사형(Investigation) 검색 엔진**입니다.  
+로컬 PC에서 돌아가는 **웹 조사형(Investigation) 검색 엔진**입니다.  
 단순 “유사 문장 찾기”가 아니라, 질문에 대해 **결론 + 근거 + 출처 + 반례/모순 + 설명가능한 진단**을 함께 반환하는 것을 목표로 합니다.
 
 ## TL;DR
 
-- 오프라인 인덱싱(임베딩/ANN/BM25) + 온라인 멀티패스 하이브리드 검색
+- DuckDuckGo 기반 **웹 멀티패스 하이브리드 검색**(+ 페이지 본문 fetch 옵션)
+- (옵션) 오프라인 인덱싱(임베딩/ANN/BM25)으로 **로컬 코퍼스**도 같이 검색
 - 모든 결과에 `SourceCitation`(출처) 포함
 - 모순(contradiction) 전용 단계 + reranker 단계
 - 검색 DSL(필터) + explain/하이라이트 + 평가 하니스
 - 온라인 학습(가중치/토큰 boost) + 사용자 검색정보 삭제 API
-- 로컬 근거 부족 시 DuckDuckGo `web_snippet` fallback(옵션)
+- 지식도서관(Knowledge Library)에 결과/근거 자동 저장(옵션)
 
 ## 목차
 
@@ -41,17 +42,19 @@
 
 ## 주요 기능
 
-- **오프라인 빌드**
+- **웹 멀티패스 하이브리드 검색**
+  - Pass A(정방향) / Pass B(반증) / Pass C(경계조건)
+  - DuckDuckGo 검색 결과를 `web_snippet` 근거로 변환
+  - (옵션) 결과 URL의 **페이지 본문(HTML/PDF)**을 fetch/파싱하여 `web_page_text` 근거로 확장
+  - BM25 + dense + lexical + RRF 융합 점수
+  - 남은 time budget에 따라 후보 수 동적 조절
+  - reranker는 상위 후보만 선택 적용(`max_rerank_candidates`)
+- **오프라인 빌드(옵션: 로컬 코퍼스)**
   - evidence units(`evidence_units.json`)
   - embeddings(`evidence_embeddings.npy`) + ANN(`ann_index.*`)
   - BM25(`bm25_index.json`) 저장/로드
   - 샤딩 아티팩트(`shards/shard_xxx/*`)
   - 증분 임베딩 재사용(`previous_build_dir`)
-- **온라인 멀티패스 하이브리드 검색**
-  - Pass A(정방향) / Pass B(반증) / Pass C(경계조건)
-  - BM25 + dense + lexical + RRF 융합 점수
-  - 남은 time budget에 따라 후보 수 동적 조절
-  - reranker는 상위 후보만 선택 적용(`max_rerank_candidates`)
 - **모순 검출 단계**
   - `ContradictionDetector` 인터페이스
   - 기본 heuristic detector
@@ -71,14 +74,29 @@
 - **온라인 학습 + 삭제**
   - stage score 기반 가중치/토큰 boost 점진 업데이트
   - `delete_user_search_data()`로 캐시/학습 상태 즉시 삭제
-- **웹 fallback (옵션)**
-  - 로컬 근거가 부족할 때 DuckDuckGo 결과를 `web_snippet` 근거로 병합
-  - DSL에서 `-source:web_snippet`로 외부 결과 제외 가능
-  - 기본적으로 웹 검색은 **별도 파이썬 프로세스(서브프로세스)**에서 수행(최소 격리). 강한 격리가 필요하면 VM/Docker/Windows Sandbox 권장
+- **웹 검색 격리(기본)**
+  - 기본적으로 웹 검색/페이지 fetch는 **별도 파이썬 프로세스(서브프로세스)**에서 수행(최소 격리)
+  - 강한 격리가 필요하면 VM/Docker/Windows Sandbox 권장
 
 ## 빠른 시작
 
 로컬 패키지 경로를 위해 `PYTHONPATH=src`로 실행합니다.
+
+```powershell
+$env:PYTHONPATH="src"
+$env:INVESTIGATION_SEARCH_AUTO_INSTALL="1"  # (옵션) 필요한 파이썬 의존성 자동 설치
+
+# 웹 검색(TUI) 실행: 기본적으로 DuckDuckGo 결과를 근거로 사용합니다.
+python -m investigation_search tui --enable-knowledge-library --web-fetch
+
+# 로컬 코퍼스(문서 파일)도 같이 쓰려면:
+# python -m investigation_search tui --docs docs/a.pdf docs/b.txt --enable-knowledge-library
+
+# 오프라인 빌드 산출물(build-dir)을 쓰려면:
+# python -m investigation_search tui --build-dir artifacts/build --enable-knowledge-library
+```
+
+로컬 EvidenceUnit으로 바로 엔진을 구성하는 예시는 아래입니다.
 
 ```powershell
 $env:PYTHONPATH="src"
@@ -165,8 +183,11 @@ pip install -U pdfplumber pillow pytesseract
 $env:PYTHONPATH="src"
 $env:INVESTIGATION_SEARCH_AUTO_INSTALL="1"  # (옵션) 필요한 파이썬 의존성 자동 설치
 
-# TUI 실행 (오프라인 빌드 사용 권장)
-python -m investigation_search tui --build-dir artifacts/build --enable-knowledge-library
+# TUI 실행 (웹 검색이 기본)
+python -m investigation_search tui --enable-knowledge-library --web-fetch
+
+# 웹 검색만(온라인) 강제: 로컬 코퍼스/빌드 없이 DuckDuckGo 기반
+python -m investigation_search tui --web-only --enable-knowledge-library --web-fetch
 
 # 지식도서관 보기용 HTML export
 python -m investigation_search library export --out-dir artifacts/library_export --format html
@@ -257,6 +278,7 @@ result = engine.search("주제", mode="reporter")
 - `artifacts/knowledge_library/sessions/<session_id>.json`: 검색 결과(모드/쿼리/출처/근거/진단)
 - `artifacts/knowledge_library/sessions.jsonl`: 세션 인덱스
 - `artifacts/knowledge_library/evidence/web_snippets.jsonl`: 웹 스니펫 근거(있을 때)
+- `artifacts/knowledge_library/evidence/web_pages.jsonl`: 웹 페이지 본문 근거(있을 때)
 - (옵션) `artifacts/knowledge_library/osint/<session_id>.json`: OSINT 아티팩트(모드에 따라)
 
 ### 보기(Export)
@@ -325,10 +347,10 @@ $env:PYTHONPATH="src"
 python -m investigation_search library delete --yes
 ```
 
-- 웹 fallback은 외부로 쿼리를 전송합니다. 개인정보가 민감하면:
-  - `enable_web_fallback=False` 또는
-  - DSL로 `-source:web_snippet` 사용
-  - (옵션) 웹 fallback 격리 해제: `enable_web_sandbox=False` 또는 TUI에서 `--no-web-sandbox`
+- 웹 검색/페이지 fetch는 외부로 쿼리와 URL 요청을 전송합니다. 개인정보가 민감하면:
+  - `enable_web_fallback=False` 또는 TUI에서 `--no-web`
+  - DSL로 `-source:web_snippet` / `-source:web_page_text` 사용
+  - (옵션) 서브프로세스 격리 해제: `enable_web_sandbox=False` 또는 TUI에서 `--no-web-sandbox`
 
 ## 문제 해결
 
