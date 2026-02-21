@@ -1,2 +1,32 @@
+### Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.log
+
+### Virtualenv
+.venv/
+venv/
+env/
+ENV/
+
+### Build / Packaging
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+### Local Artifacts (this repo)
+artifacts/
+
+### OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
