@@ -56,7 +56,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+    # Use ASCII-safe JSON to avoid platform stdout encoding issues (e.g., cp949).
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True))
     return 0
 
 

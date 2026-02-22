@@ -136,7 +136,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             session_id = result.diagnostics.get("knowledge_library_session_id")
             if session_id:
                 payload["knowledge_library_session_id"] = session_id
-            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            _print_json(payload)
             return 0
 
         from .viewer import render_result_text
@@ -191,7 +191,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             from .library_viewer import load_knowledge_library_session
 
             payload = load_knowledge_library_session(lib_dir, args.session_id)
-            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            _print_json(payload)
             return 0
         if args.library_cmd == "export":
             from .library_viewer import export_knowledge_library
@@ -203,7 +203,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 session_ids=args.session,
                 include_raw=not args.no_raw,
             )
-            print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+            _print_json(report)
             return 0
         if args.library_cmd == "serve":
             _serve_dir(Path(args.dir), host=str(args.host), port=int(args.port))
@@ -333,6 +333,14 @@ def _ensure_runtime_dependencies(cmd: str) -> None:
 
 def _mode_help(prefix: str) -> str:
     return f"{prefix} mode (investigation/reporter/fbi/collection/sniper/rumor/library/llm)"
+
+
+def _print_json(payload: object) -> None:
+    try:
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    except UnicodeEncodeError:
+        # Windows cp949 등 제한된 콘솔 인코딩에서는 확장 유니코드 출력이 실패할 수 있다.
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
 
 
 def _existing(root: Path | None, *names: str) -> list[Path]:

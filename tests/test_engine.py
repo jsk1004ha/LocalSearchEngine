@@ -3,6 +3,7 @@ from __future__ import annotations
 from unittest.mock import patch
 import tempfile
 from pathlib import Path
+import os
 
 import sys
 import types
@@ -540,6 +541,28 @@ def test_subprocess_sandbox_web_provider_parses_json() -> None:
         assert rows[0].url == "https://example.com/a"
 
 
+def test_subprocess_sandbox_web_provider_strips_proxy_env_by_default() -> None:
+    from investigation_search.websearch import SubprocessSandboxWebSearchProvider
+
+    captured_env = {}
+
+    class DummyProc:
+        stdout = '{"ok": true, "results": []}'
+
+    def fake_run(*args, **kwargs):
+        nonlocal captured_env
+        captured_env = dict(kwargs.get("env") or {})
+        return DummyProc()
+
+    with patch.dict(os.environ, {"HTTP_PROXY": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9"}, clear=False):
+        with patch("investigation_search.websearch.subprocess.run", side_effect=fake_run):
+            provider = SubprocessSandboxWebSearchProvider(timeout_sec=1.0)
+            provider.search("hello", max_results=2)
+
+    assert "HTTP_PROXY" not in captured_env
+    assert "HTTPS_PROXY" not in captured_env
+
+
 def test_parse_mode_llm_alias() -> None:
     from investigation_search.modes import SearchMode, parse_mode
 
@@ -558,3 +581,38 @@ def test_free_osint_search_provider_delegates_to_searxng() -> None:
 
     assert rows
     assert rows[0].provider == "searxng"
+
+
+def test_free_osint_search_provider_falls_back_to_duckduckgo_when_searxng_fails() -> None:
+    from investigation_search.websearch import DuckDuckGoSearchProvider, FreeOSINTSearchProvider, SearxNGSearchProvider
+
+    provider = FreeOSINTSearchProvider()
+    with patch.object(SearxNGSearchProvider, "search", side_effect=RuntimeError("searx down")):
+        with patch.object(DuckDuckGoSearchProvider, "search", return_value=[
+            WebSearchResult(title="DDG Result", url="https://ddg.example.com", snippet="snippet", rank=1, provider="duckduckgo")
+        ]):
+            rows = provider.search("test query", max_results=3)
+
+    assert rows
+    assert rows[0].provider == "duckduckgo"
+
+
+def test_engine_web_fallback_includes_error_message_details() -> None:
+    class FailingProvider:
+        provider_name = "failing-provider"
+
+        def search(self, query, *, max_results=5):
+            raise RuntimeError("network unavailable")
+
+    engine = InvestigationEngine(
+        _sample_units(),
+        enable_cache=False,
+        online_learning=False,
+        web_search_provider=FailingProvider(),
+        enable_web_fallback=True,
+    )
+    result = engine.search("zzzxxyyqq", top_k_per_pass=2, time_budget_sec=120)
+    passes = result.diagnostics["web_fallback"]["passes"]
+
+    assert passes
+    assert "RuntimeError: network unavailable" in str(passes[0]["error"])

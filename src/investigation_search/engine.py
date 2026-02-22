@@ -844,7 +844,10 @@ class InvestigationEngine:
                 rows = provider.search(qp.query, max_results=max_results)
             except Exception as exc:
                 had_error = True
-                pass_summaries.append({"pass": qp.name, "query": qp.query, "error": f"{type(exc).__name__}"})
+                err = f"{type(exc).__name__}: {exc}"
+                if len(err) > 280:
+                    err = err[:277] + "..."
+                pass_summaries.append({"pass": qp.name, "query": qp.query, "error": err})
                 continue
             pass_summaries.append({"pass": qp.name, "query": qp.query, "result_count": len(rows)})
             for row in rows:

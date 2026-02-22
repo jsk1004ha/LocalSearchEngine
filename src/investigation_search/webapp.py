@@ -67,6 +67,12 @@ def _build_handler(state: _AppState):
                     {"ok": True, "config": _public_config(state.config), "modes": [m.value for m in SearchMode]},
                 )
                 return
+            if path == "/favicon.ico":
+                self._send_bytes(HTTPStatus.NO_CONTENT, b"", content_type="image/x-icon")
+                return
+            if path.startswith("/.well-known/"):
+                self._send_bytes(HTTPStatus.NO_CONTENT, b"", content_type="text/plain; charset=utf-8")
+                return
             if path == "/api/health":
                 self._send_json(HTTPStatus.OK, {"ok": True, "status": "healthy"})
                 return
@@ -201,7 +207,7 @@ def _render_index_html(config: WebUiConfig) -> str:
         "default_max_items": config.default_max_items,
         "default_show_diagnostics": config.default_show_diagnostics,
     }
-    return _INDEX_HTML_TEMPLATE.replace("__BOOTSTRAP__", json.dumps(bootstrap, ensure_ascii=False))
+    return _INDEX_HTML_TEMPLATE.replace("__BOOTSTRAP_JSON__", json.dumps(bootstrap, ensure_ascii=False))
 
 
 _INDEX_HTML_TEMPLATE = """<!doctype html>
@@ -262,7 +268,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible,button:focus-vis
   </section>
 </main>
 <script>
-window.__BOOTSTRAP__=__BOOTSTRAP__;
+window.__BOOTSTRAP__=__BOOTSTRAP_JSON__;
 (()=>{const b=window.__BOOTSTRAP__||{},id=(x)=>document.getElementById(x),mode=id("mode"),query=id("query"),topk=id("topk"),budget=id("budget"),maxItems=id("max-items"),diagToggle=id("diag-toggle"),diagBox=id("diag-box"),status=id("status"),run=id("run"),title=id("title"),statMode=id("stat-mode"),statTopk=id("stat-topk"),statBudget=id("stat-budget"),statHealth=id("stat-health"),answer=id("answer"),answerSources=id("answer-sources"),evidence=id("evidence"),contra=id("contra"),diagJson=id("diag-json"),sumE=id("sum-e"),sumC=id("sum-c"),sumS=id("sum-s"),sumK=id("sum-k"),card=id("search-card");
 const labels={investigation:"균형",reporter:"광범위",fbi:"OSINT",collection:"자료",sniper:"단일",rumor:"다주장",library:"신뢰",llm:"LLM"};
 const esc=(v)=>String(v??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\"/g,"&quot;").replace(/'/g,"&#039;");
@@ -270,9 +276,9 @@ const n=(v,d,lo,hi)=>{const x=Math.round(Number(v));return Number.isFinite(x)?Ma
 const setStatus=(t,k="")=>{status.textContent=t;status.className="status"+(k?" "+k:"");};
 const busy=(on)=>{run.disabled=on;card.style.opacity=on?"0.84":"1";};
 const modes=["investigation","reporter","fbi","collection","sniper","rumor","library","llm"];
-const renderRows=(rows,el,empty)=>{if(!Array.isArray(rows)||rows.length===0){el.innerHTML='<p class="empty">'+esc(empty)+"</p>";return;}el.innerHTML=rows.map((r,i)=>{const ev=r.evidence||{},v=String(r.verdict||"uncertain").toLowerCase(),cls=(v==="supports"||v==="contradicts")?v:"uncertain",sc=Number(r.score||0).toFixed(4),src=(r.source&&r.source.citation_id)||"none",md=ev.metadata||{},url=(typeof md.url==="string"&&md.url)?md.url:ev.doc_id,isHttp=/^https?:\\/\\//i.test(String(url||"")),host=isHttp?String(url).replace(/^https?:\\/\\//i,"").split("/")[0]:String(url||"local"),link=isHttp?'<a href="'+esc(url)+'" target="_blank" rel="noopener noreferrer">'+esc(host)+"</a>":esc(host);return '<article class="item"><div class="head"><span class="badge '+cls+'">'+esc(cls)+'</span><span class="score">#'+(i+1)+" · "+esc(sc)+'</span></div><div class="content">'+esc(ev.content||"")+'</div><div class="meta"><span>citation: '+esc(src)+"</span><span>source: "+link+"</span></div><div class=\"meta\"><span>why: "+esc(r.why_it_matches||"")+"</span></div></article>";}).join("");};
+const renderRows=(rows,el,empty)=>{if(!Array.isArray(rows)||rows.length===0){el.innerHTML='<p class="empty">'+esc(empty)+"</p>";return;}el.innerHTML=rows.map((r,i)=>{const ev=r.evidence||{},v=String(r.verdict||"uncertain").toLowerCase(),cls=(v==="supports"||v==="contradicts")?v:"uncertain",sc=Number(r.score||0).toFixed(4),src=(r.source&&r.source.citation_id)||"none",md=ev.metadata||{},url=(typeof md.url==="string"&&md.url)?md.url:ev.doc_id,isHttp=/^https?:\\/\\//i.test(String(url||"")),host=isHttp?String(url).replace(/^https?:\\/\\//i,"").split("/")[0]:String(url||"local"),link=isHttp?'<a href="'+esc(url)+'" target="_blank" rel="noopener noreferrer">'+esc(host)+"</a>":esc(host);return `<article class="item"><div class="head"><span class="badge ${cls}">${esc(cls)}</span><span class="score">#${i+1} | ${esc(sc)}</span></div><div class="content">${esc(ev.content||"")}</div><div class="meta"><span>citation: ${esc(src)}</span><span>source: ${link}</span></div><div class="meta"><span>why: ${esc(r.why_it_matches||"")}</span></div></article>`;}).join("");};
 const renderAnswerSources=(xs)=>{if(!Array.isArray(xs)||xs.length===0){answerSources.innerHTML='<span class="chip">Answer source: none</span>';return;}answerSources.innerHTML=xs.slice(0,4).map((s)=>'<span class="chip">'+esc((s&&s.citation_id)||"unknown")+"</span>").join("");};
-const setConfig=(cfg,m)=>{title.textContent=String((cfg&&cfg.title)||"Investigation Search Web");document.title=title.textContent;const mm=Array.isArray(m)&&m.length?m:modes;mode.innerHTML=mm.map((x)=>'<option value="'+esc(x)+'">'+esc(x+(labels[x]?" · "+labels[x]:""))+"</option>").join("");mode.value=mm.includes(cfg.default_mode)?cfg.default_mode:mm[0];topk.value=n(cfg.default_top_k,5,1,30);budget.value=n(cfg.default_time_budget_sec,120,1,600);maxItems.value=n(cfg.default_max_items,8,1,30);diagToggle.checked=!!cfg.default_show_diagnostics;diagBox.open=diagToggle.checked;statMode.textContent=mode.value;statTopk.textContent=String(topk.value);statBudget.textContent=String(budget.value)+"s";};
+const setConfig=(cfg,m)=>{title.textContent=String((cfg&&cfg.title)||"Investigation Search Web");document.title=title.textContent;const mm=Array.isArray(m)&&m.length?m:modes;mode.innerHTML=mm.map((x)=>'<option value="'+esc(x)+'">'+esc(x+(labels[x]?" | "+labels[x]:""))+"</option>").join("");mode.value=mm.includes(cfg.default_mode)?cfg.default_mode:mm[0];topk.value=n(cfg.default_top_k,5,1,30);budget.value=n(cfg.default_time_budget_sec,120,1,600);maxItems.value=n(cfg.default_max_items,8,1,30);diagToggle.checked=!!cfg.default_show_diagnostics;diagBox.open=diagToggle.checked;statMode.textContent=mode.value;statTopk.textContent=String(topk.value);statBudget.textContent=String(budget.value)+"s";};
 const apply=(r)=>{answer.textContent=String(r.answer||"");renderAnswerSources(r.answer_sources||[]);renderRows(r.evidence||[],evidence,"근거가 없습니다.");renderRows(r.contradictions||[],contra,"반례가 없습니다.");diagJson.textContent=JSON.stringify(r.diagnostics||{},null,2);sumE.textContent="Evidence: "+String(r.evidence_total||0);sumC.textContent="Contradictions: "+String(r.contradictions_total||0);sumS.textContent="Sources: "+String(r.source_count||0);sumK.textContent="Session: "+String(r.knowledge_library_session_id||"none");};
 const runSearch=async()=>{const q=query.value.trim();if(!q){setStatus("검색어를 입력하세요","error");query.focus();return;}const payload={query:q,mode:mode.value,top_k_per_pass:n(topk.value,5,1,30),time_budget_sec:n(budget.value,120,1,600),max_items:n(maxItems.value,8,1,30),include_diagnostics:!!diagToggle.checked};busy(true);setStatus("검색 중...");statMode.textContent=payload.mode;statTopk.textContent=String(payload.top_k_per_pass);statBudget.textContent=String(payload.time_budget_sec)+"s";try{const res=await fetch("/api/search",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const body=await res.json();if(!res.ok||!body.ok){throw new Error((body&&body.error&&body.error.message)||"검색 실패");}apply(body.result||{});setStatus("완료","ok");}catch(err){setStatus("오류: "+(err&&err.message?err.message:"unknown"),"error");}finally{busy(false);} };
 const load=async()=>{try{const r=await fetch("/api/config");const p=await r.json();if(!r.ok||!p.ok)throw new Error("config");setConfig(p.config||b,p.modes||modes);statHealth.textContent="healthy";}catch{setConfig(b,modes);statHealth.textContent="degraded";}};
