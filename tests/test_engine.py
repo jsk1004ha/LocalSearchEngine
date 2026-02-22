@@ -458,6 +458,17 @@ def test_library_publish_zip_creates_archive() -> None:
         assert out.stat().st_size > 0
 
 
+
+
+def test_modes_are_web_enabled_for_online_search() -> None:
+    from investigation_search.modes import SearchMode, profile_for_mode
+
+    for mode in SearchMode:
+        profile = profile_for_mode(mode)
+        assert profile.always_web_search is True
+        assert profile.enable_web_fallback is True
+        assert profile.web_max_results > 0
+
 def test_subprocess_sandbox_web_provider_parses_json() -> None:
     from investigation_search.websearch import SubprocessSandboxWebSearchProvider
 
