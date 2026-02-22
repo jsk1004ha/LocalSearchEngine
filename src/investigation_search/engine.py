@@ -93,6 +93,8 @@ class InvestigationEngine:
         web_fetch_max_bytes: int = 2_500_000,
         web_fetch_max_text_chars: int = 180_000,
         web_fetch_allow_pdf: bool = True,
+        web_fetch_crawl_depth: int = 0,
+        web_fetch_max_workers: int = 4,
         enable_knowledge_library: bool = False,
         knowledge_library_dir: str | Path = Path("artifacts") / "knowledge_library",
         trusted_domains: Sequence[str] | None = None,
@@ -128,6 +130,7 @@ class InvestigationEngine:
                 )
         self.enable_web_fetch = bool(enable_web_fetch)
         self.web_fetch_max_pages = max(0, int(web_fetch_max_pages))
+        self.web_fetch_crawl_depth = max(0, min(int(web_fetch_crawl_depth), 2))
         if web_fetch_provider is not None:
             self.web_fetch_provider = web_fetch_provider
         else:
@@ -137,6 +140,7 @@ class InvestigationEngine:
                     max_bytes=max(0, int(web_fetch_max_bytes)),
                     max_text_chars=max(0, int(web_fetch_max_text_chars)),
                     allow_pdf=bool(web_fetch_allow_pdf),
+                    max_workers=max(1, int(web_fetch_max_workers)),
                 )
             else:
                 self.web_fetch_provider = StdlibWebFetchProvider(
@@ -144,6 +148,7 @@ class InvestigationEngine:
                     max_bytes=max(0, int(web_fetch_max_bytes)),
                     max_text_chars=max(0, int(web_fetch_max_text_chars)),
                     allow_pdf=bool(web_fetch_allow_pdf),
+                    max_workers=max(1, int(web_fetch_max_workers)),
                 )
         self.trusted_domains = {d.strip().lower() for d in (trusted_domains or []) if str(d).strip()}
         self._library = KnowledgeLibrary(knowledge_library_dir) if enable_knowledge_library else None
@@ -285,6 +290,7 @@ class InvestigationEngine:
                     retrieval_options=effective_retrieval_options,
                     enable_web_fetch=bool(self.enable_web_fetch and profile.enable_web_fetch),
                     web_fetch_max_pages=min(self.web_fetch_max_pages, int(profile.web_fetch_max_pages)),
+                    web_fetch_crawl_depth=int(self.web_fetch_crawl_depth),
                 )
                 if web_hits:
                     selected.extend(web_hits)
@@ -798,6 +804,7 @@ class InvestigationEngine:
         retrieval_options: RetrievalOptions,
         enable_web_fetch: bool,
         web_fetch_max_pages: int,
+        web_fetch_crawl_depth: int,
     ):
         provider = self.web_search_provider
         pass_summaries: list[dict[str, object]] = []
@@ -864,59 +871,85 @@ class InvestigationEngine:
 
         page_units: list[EvidenceUnit] = []
         if enable_web_fetch and want_page_text and web_rows and web_fetch_max_pages > 0:
-            urls = [str(row.url or "").strip() for row in web_rows]
-            urls = [u for u in urls if u]
-            urls = urls[: max(0, int(web_fetch_max_pages))]
-            try:
-                pages = self.web_fetch_provider.fetch(urls, max_pages=len(urls))
-                fetch_meta["used"] = True
-                fetch_meta["page_count"] = len(pages)
-                # Convert pages -> EvidenceUnits
-                max_chunks_per_page = 10
-                for page in pages:
-                    if not page.ok:
-                        continue
-                    base_url = (page.final_url or page.url or "").strip()
-                    if not base_url:
-                        continue
-                    base_row = seen_by_url.get(page.url) or seen_by_url.get(base_url)
-                    rank = int(getattr(base_row, "rank", 0) or 0) if base_row is not None else 0
-                    passes_for_url = sorted(url_passes.get(page.url, set()) | url_passes.get(base_url, set()))
+            max_chunks_per_page = 10
+            base_urls = [str(row.url or "").strip() for row in web_rows]
+            base_urls = [u for u in base_urls if u]
+            base_urls = base_urls[: max(0, int(web_fetch_max_pages))]
+            visited: set[str] = set()
+            to_visit = list(base_urls)
+            for depth in range(max(0, int(web_fetch_crawl_depth)) + 1):
+                if not to_visit:
+                    break
+                batch = [u for u in to_visit if u and u not in visited]
+                to_visit = []
+                if not batch:
+                    continue
+                for u in batch:
+                    visited.add(u)
+                try:
+                    pages = self.web_fetch_provider.fetch(batch, max_pages=len(batch))
+                    fetch_meta["used"] = True
+                    fetch_meta["page_count"] = int(fetch_meta.get("page_count", 0)) + len(pages)
+                    next_level: list[str] = []
+                    for page in pages:
+                        if not page.ok:
+                            continue
+                        base_url = (page.final_url or page.url or "").strip()
+                        if not base_url:
+                            continue
+                        base_row = seen_by_url.get(page.url) or seen_by_url.get(base_url)
+                        rank = int(getattr(base_row, "rank", 0) or 0) if base_row is not None else 0
+                        passes_for_url = sorted(url_passes.get(page.url, set()) | url_passes.get(base_url, set()))
 
-                    chunks = chunk_text(page.text, max_chars=900, overlap=120, min_chars=160)
-                    if not chunks:
-                        continue
-                    title = (page.title or (base_row.title if base_row is not None else "") or "").strip()
-                    section_base = title[:90] if title else "web_page"
+                        chunks = chunk_text(page.text, max_chars=900, overlap=120, min_chars=160)
+                        if not chunks:
+                            continue
+                        title = (page.title or (base_row.title if base_row is not None else "") or "").strip()
+                        section_base = title[:90] if title else "web_page"
 
-                    for idx, (chunk, start_off, end_off) in enumerate(chunks[:max_chunks_per_page], start=1):
-                        page_units.append(
-                            EvidenceUnit(
-                                doc_id=base_url,
-                                source_type=SourceType.WEB_PAGE_TEXT,
-                                content=chunk,
-                                section_path=f"{section_base}#chunk{idx}",
-                                char_start=int(start_off),
-                                char_end=int(end_off),
-                                timestamp=now_iso,
-                                confidence=0.6,
-                                metadata={
-                                    "provider": getattr(self.web_search_provider, "provider_name", None),
-                                    "fetch_provider": getattr(self.web_fetch_provider, "provider_name", None),
-                                    "url": base_url,
-                                    "title": title,
-                                    "status": page.status,
-                                    "content_type": page.content_type,
-                                    "web_rank": rank,
-                                    "web_passes": passes_for_url,
-                                },
+                        for idx, (chunk, start_off, end_off) in enumerate(chunks[:max_chunks_per_page], start=1):
+                            page_units.append(
+                                EvidenceUnit(
+                                    doc_id=base_url,
+                                    source_type=SourceType.WEB_PAGE_TEXT,
+                                    content=chunk,
+                                    section_path=f"{section_base}#chunk{idx}",
+                                    char_start=int(start_off),
+                                    char_end=int(end_off),
+                                    timestamp=now_iso,
+                                    confidence=0.6,
+                                    metadata={
+                                        "provider": getattr(self.web_search_provider, "provider_name", None),
+                                        "fetch_provider": getattr(self.web_fetch_provider, "provider_name", None),
+                                        "url": base_url,
+                                        "title": title,
+                                        "status": page.status,
+                                        "content_type": page.content_type,
+                                        "web_rank": rank,
+                                        "web_passes": passes_for_url,
+                                        "crawl_depth": depth,
+                                    },
+                                )
                             )
-                        )
-                fetch_meta["unit_count"] = len(page_units)
-            except Exception as exc:
-                fetch_meta["used"] = False
-                fetch_meta["error"] = f"{type(exc).__name__}"
-
+                        if depth < max(0, int(web_fetch_crawl_depth)):
+                            next_level.extend([u for u in page.discovered_links if u not in visited])
+                    if depth < max(0, int(web_fetch_crawl_depth)):
+                        unique_next: list[str] = []
+                        seen_next: set[str] = set()
+                        for u in next_level:
+                            if u in seen_next:
+                                continue
+                            seen_next.add(u)
+                            unique_next.append(u)
+                        remain_budget = max(0, int(web_fetch_max_pages) - len(base_urls))
+                        if remain_budget > 0:
+                            to_visit = unique_next[:remain_budget]
+                except Exception as exc:
+                    fetch_meta["used"] = False
+                    fetch_meta["error"] = f"{type(exc).__name__}"
+                    break
+                finally:
+                    fetch_meta["unit_count"] = len(page_units)
         if page_units:
             web_units.extend(page_units)
 
@@ -964,13 +997,17 @@ class InvestigationEngine:
         adjusted: list[ScoredEvidence] = []
         for item in hits:
             rank = int(item.evidence.metadata.get("web_rank") or 0) or 999
+            pass_count = len(item.evidence.metadata.get("web_passes") or [])
             rank_prior = max(0.55, 1.0 - (rank - 1) * 0.05)
+            pass_prior = 1.0 + min(0.18, max(0.0, pass_count - 1) * 0.06)
             raw_score = float(item.score)
-            final_score = raw_score * rank_prior
+            final_score = raw_score * rank_prior * pass_prior
             stage = dict(item.stage_scores)
             stage.setdefault("hybrid_raw", float(stage.get("hybrid", raw_score)))
             stage["web_rank"] = float(rank)
             stage["web_rank_prior"] = float(rank_prior)
+            stage["web_pass_count"] = float(pass_count)
+            stage["web_pass_prior"] = float(pass_prior)
             stage["hybrid"] = final_score
             adjusted.append(
                 ScoredEvidence(

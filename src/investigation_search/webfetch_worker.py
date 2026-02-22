@@ -17,6 +17,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-pages", type=int, default=5)
     p.add_argument("--user-agent", type=str, default="Mozilla/5.0 (compatible; InvestigationSearch/0.9)")
     p.add_argument("--allow-pdf", action="store_true", help="Allow PDF parsing via pypdf if installed")
+    p.add_argument("--max-workers", type=int, default=4)
 
     args = p.parse_args(argv)
     urls = args.url or []
@@ -30,6 +31,7 @@ def main(argv: list[str] | None = None) -> int:
             max_redirects=int(args.max_redirects),
             max_pages=int(args.max_pages),
             allow_pdf=bool(args.allow_pdf),
+            max_workers=int(args.max_workers),
         )
         payload = {
             "ok": True,
@@ -43,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
                     "text": page.text,
                     "bytes_read": page.bytes_read,
                     "truncated": page.truncated,
+                    "discovered_links": list(page.discovered_links),
                     "error": page.error,
                 }
                 for page in pages

@@ -8,6 +8,7 @@ import re
 import socket
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Iterable, List, Protocol, Sequence, Tuple
 
@@ -15,6 +16,7 @@ from typing import Iterable, List, Protocol, Sequence, Tuple
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)[^>]*>.*?</\\1>", re.IGNORECASE | re.DOTALL)
 _TAG_RE = re.compile(r"<[^>]+>")
 _TITLE_RE = re.compile(r"<title[^>]*>(?P<title>.*?)</title>", re.IGNORECASE | re.DOTALL)
+_HREF_RE = re.compile(r"<a[^>]+href=[\"'](?P<href>[^\"']+)[\"']", re.IGNORECASE)
 _WS_RE = re.compile(r"[ \\t\\r\\f\\v]+")
 _NL_RE = re.compile(r"\\n{3,}")
 _BLOCK_TAG_RE = re.compile(r"</?(p|br|li|div|tr|h[1-6]|pre|blockquote)[^>]*>", re.IGNORECASE)
@@ -30,6 +32,7 @@ class WebFetchedPage:
     text: str
     bytes_read: int
     truncated: bool
+    discovered_links: tuple[str, ...] = ()
     error: str | None = None
 
     @property
@@ -53,6 +56,7 @@ class StdlibWebFetchProvider:
     max_text_chars: int = 180_000
     max_redirects: int = 6
     allow_pdf: bool = True
+    max_workers: int = 4
 
     def fetch(self, urls: Sequence[str] | Iterable[str], *, max_pages: int = 5) -> List[WebFetchedPage]:
         return fetch_urls(
@@ -64,6 +68,7 @@ class StdlibWebFetchProvider:
             max_redirects=int(self.max_redirects),
             max_pages=int(max_pages),
             allow_pdf=bool(self.allow_pdf),
+            max_workers=int(self.max_workers),
         )
 
 
@@ -77,17 +82,18 @@ def fetch_urls(
     max_redirects: int,
     max_pages: int,
     allow_pdf: bool,
+    max_workers: int,
 ) -> List[WebFetchedPage]:
     seq = [str(u).strip() for u in list(urls)]
     seq = [u for u in seq if u]
     if not seq or max_pages <= 0:
         return []
 
-    out: list[WebFetchedPage] = []
-    for raw_url in seq[: max(0, int(max_pages))]:
-        out.append(
+    capped = seq[: max(0, int(max_pages))]
+    if len(capped) <= 1:
+        return [
             _fetch_one(
-                raw_url,
+                capped[0],
                 timeout_sec=float(timeout_sec),
                 user_agent=str(user_agent),
                 max_bytes=int(max_bytes),
@@ -95,7 +101,30 @@ def fetch_urls(
                 max_redirects=int(max_redirects),
                 allow_pdf=bool(allow_pdf),
             )
-        )
+        ] if capped else []
+
+    out: list[WebFetchedPage] = []
+    with ThreadPoolExecutor(max_workers=max(1, min(int(max_workers), len(capped)))) as executor:
+        futures = {
+            executor.submit(
+                _fetch_one,
+                raw_url,
+                timeout_sec=float(timeout_sec),
+                user_agent=str(user_agent),
+                max_bytes=int(max_bytes),
+                max_text_chars=int(max_text_chars),
+                max_redirects=int(max_redirects),
+                allow_pdf=bool(allow_pdf),
+            ): idx
+            for idx, raw_url in enumerate(capped)
+        }
+        ordered: dict[int, WebFetchedPage] = {}
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            ordered[idx] = fut.result()
+        for idx in range(len(capped)):
+            if idx in ordered:
+                out.append(ordered[idx])
     return out
 
 
@@ -290,6 +319,8 @@ def _fetch_one(
     title = ""
     extracted = ""
 
+    discovered_links: tuple[str, ...] = ()
+
     if ("application/pdf" in ctype_lower or url_lower.endswith(".pdf")) and allow_pdf:
         extracted, title = _extract_pdf_text(raw, max_chars=max_text_chars)
         if not extracted:
@@ -304,10 +335,24 @@ def _fetch_one(
                 truncated=truncated,
                 error="pdf_no_text",
             )
+    elif _is_image_content(content_type=content_type, url=final_url):
+        extracted, title = _extract_image_text(raw, url=final_url, max_chars=max_text_chars)
+        if not extracted:
+            return WebFetchedPage(
+                url=url,
+                final_url=final_url,
+                status=status,
+                content_type=content_type,
+                title=title,
+                text="",
+                bytes_read=bytes_read,
+                truncated=truncated,
+                error="image_no_text",
+            )
     else:
         decoded = _decode_bytes(raw, content_type=content_type)
         if "<html" in decoded.lower() or "text/html" in ctype_lower:
-            extracted, title = _html_to_text(decoded)
+            extracted, title, discovered_links = _html_to_text(decoded, base_url=final_url)
         else:
             extracted = _normalize_text(decoded)
 
@@ -321,6 +366,7 @@ def _fetch_one(
         text=extracted,
         bytes_read=bytes_read,
         truncated=truncated,
+        discovered_links=discovered_links,
         error=None if extracted.strip() else "empty_text",
     )
 
@@ -352,9 +398,9 @@ def _normalize_text(text: str) -> str:
     return s.strip()
 
 
-def _html_to_text(raw_html: str) -> tuple[str, str]:
+def _html_to_text(raw_html: str, *, base_url: str = "") -> tuple[str, str, tuple[str, ...]]:
     if not raw_html:
-        return "", ""
+        return "", "", ()
     # Title
     title = ""
     m = _TITLE_RE.search(raw_html)
@@ -371,7 +417,59 @@ def _html_to_text(raw_html: str) -> tuple[str, str]:
     cleaned = re.sub(r"[ \\t]*\\n[ \\t]*", "\n", cleaned)
     cleaned = _NL_RE.sub("\n\n", cleaned)
     cleaned = cleaned.strip()
-    return cleaned, title
+    links = _extract_html_links(raw_html, base_url=base_url, max_links=24)
+    return cleaned, title, links
+
+
+def _extract_html_links(raw_html: str, *, base_url: str, max_links: int) -> tuple[str, ...]:
+    if not raw_html:
+        return ()
+    out: list[str] = []
+    seen: set[str] = set()
+    base_host = (urllib.parse.urlparse(base_url).hostname or "").lower()
+    for m in _HREF_RE.finditer(raw_html):
+        href = (m.group("href") or "").strip()
+        if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
+            continue
+        absolute = urllib.parse.urljoin(base_url, href)
+        p = urllib.parse.urlparse(absolute)
+        if p.scheme.lower() not in {"http", "https"}:
+            continue
+        norm = urllib.parse.urlunparse((p.scheme, p.netloc, p.path, "", p.query, ""))
+        host = (p.hostname or "").lower()
+        if base_host and host and host != base_host:
+            continue
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+        if len(out) >= max(0, int(max_links)):
+            break
+    return tuple(out)
+
+
+def _is_image_content(*, content_type: str, url: str) -> bool:
+    ct = (content_type or "").lower()
+    if ct.startswith("image/"):
+        return True
+    lower = (url or "").lower()
+    return lower.endswith((".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"))
+
+
+def _extract_image_text(raw: bytes, *, url: str, max_chars: int) -> tuple[str, str]:
+    # Optional dependencies: pillow + pytesseract.
+    try:
+        from PIL import Image  # type: ignore[import-not-found]
+        import pytesseract  # type: ignore[import-not-found]
+    except Exception:
+        return "", ""
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            text = pytesseract.image_to_string(img) or ""
+            title = os.path.basename(urllib.parse.urlparse(url).path or "")
+    except Exception:
+        return "", ""
+    return _normalize_text(text)[: max(0, int(max_chars))], title[:240]
 
 
 def _clean_html(text: str) -> str:
@@ -501,6 +599,7 @@ class SubprocessSandboxWebFetchProvider:
     max_text_chars: int = 180_000
     max_redirects: int = 6
     allow_pdf: bool = True
+    max_workers: int = 4
 
     def fetch(self, urls: Sequence[str] | Iterable[str], *, max_pages: int = 5) -> List[WebFetchedPage]:
         import json
@@ -528,6 +627,8 @@ class SubprocessSandboxWebFetchProvider:
             str(int(max_pages)),
             "--user-agent",
             str(self.user_agent),
+            "--max-workers",
+            str(int(self.max_workers)),
         ]
         if self.allow_pdf:
             cmd.append("--allow-pdf")
@@ -578,6 +679,7 @@ class SubprocessSandboxWebFetchProvider:
                     text=str(row.get("text", "")),
                     bytes_read=int(row.get("bytes_read", 0) or 0),
                     truncated=bool(row.get("truncated", False)),
+                    discovered_links=tuple(str(u) for u in (row.get("discovered_links") or [])),
                     error=row.get("error"),
                 )
             )
