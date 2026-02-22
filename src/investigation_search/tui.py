@@ -82,7 +82,7 @@ def run_tui(
 
         def on_mount(self) -> None:  # type: ignore[override]
             self.query_one("#status", Static).update(
-                "Enter query, choose mode (investigation/report/fbi/collection/sniper/rumor/library). "
+                "Enter a web query and choose mode (investigation/report/fbi/collection/sniper/rumor/library). "
                 "Ctrl+D toggles diagnostics."
             )
 

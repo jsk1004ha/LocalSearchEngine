@@ -4,26 +4,22 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Sequence
 
 from .bootstrap import AUTO_INSTALL_ENV, auto_install_enabled, ensure_installed, repo_root
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="investigation_search", description="Investigation Search Engine tools (web-first + optional local corpus)")
+    parser = argparse.ArgumentParser(prog="investigation_search", description="Investigation Search Engine tools (web-only)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_tui = sub.add_parser("tui", help="Run terminal UI (Textual)")
-    p_tui.add_argument("--build-dir", type=str, default=None, help="Offline build directory (manifest.json 포함)")
-    p_tui.add_argument("--docs", type=str, nargs="*", default=None, help="문서 파일들(.txt/.pdf/이미지 등)")
     p_tui.add_argument("--mode", type=str, default="investigation", help="default mode (investigation/report/fbi/...)")
     p_tui.add_argument("--top-k", type=int, default=5, help="top_k_per_pass")
     p_tui.add_argument("--time-budget", type=int, default=120, help="time budget sec")
     p_tui.add_argument("--knowledge-library-dir", type=str, default=str(Path("artifacts") / "knowledge_library"))
     p_tui.add_argument("--enable-knowledge-library", action="store_true", help="persist searches to knowledge library")
-    p_tui.add_argument("--no-web", action="store_true", help="disable web search")
     p_tui.add_argument("--no-web-sandbox", action="store_true", help="disable subprocess isolation for web search")
-    p_tui.add_argument("--web-only", action="store_true", help="web search only (no local corpus/build)")
     p_tui.add_argument("--web-fetch", action="store_true", help="fetch and parse result pages (HTML/PDF) to create richer evidence")
     p_tui.add_argument("--web-fetch-pages", type=int, default=4, help="max pages to fetch per query")
     p_tui.add_argument(
@@ -77,26 +73,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         auto_install = bool(getattr(args, "auto_install", False)) or auto_install_enabled()
         if auto_install:
             root = repo_root()
-            reqs = ["requirements-tui.txt"]
-            if args.build_dir:
-                reqs.insert(0, "requirements-search.txt")
-                fallback_pkgs = ("numpy", "sentence-transformers", "hnswlib", "textual")
-            else:
-                reqs.insert(0, "requirements-core.txt")
-                fallback_pkgs = ("numpy", "textual")
+            reqs = ["requirements-core.txt", "requirements-tui.txt"]
+            fallback_pkgs = ("numpy", "textual")
             ensure_installed(
                 requirements_files=_existing(root, *reqs),
                 packages=fallback_pkgs,
                 auto_install=True,
                 quiet=False,
             )
-            if not args.build_dir and _needs_docparse(args.docs or []):
-                ensure_installed(
-                    requirements_files=_existing(root, "requirements-docparse.txt"),
-                    packages=("pdfplumber", "pypdf", "pillow", "pytesseract"),
-                    auto_install=True,
-                    quiet=False,
-                )
 
         engine = _load_engine_for_tui(args)
         from .tui import run_tui  # lazy import (optional dep: textual)
@@ -222,168 +206,20 @@ def _load_engine_for_tui(args: argparse.Namespace):
 
     enable_library = bool(getattr(args, "enable_knowledge_library", False))
     library_dir = getattr(args, "knowledge_library_dir", str(Path("artifacts") / "knowledge_library"))
-    enable_web = not bool(getattr(args, "no_web", False))
     enable_web_sandbox = not bool(getattr(args, "no_web_sandbox", False))
-    web_only = bool(getattr(args, "web_only", False))
     enable_web_fetch = bool(getattr(args, "web_fetch", False))
     web_fetch_pages = int(getattr(args, "web_fetch_pages", 4) or 0)
 
-    if web_only:
-        if args.build_dir or (args.docs or []):
-            raise SystemExit("--web-only cannot be combined with --build-dir/--docs")
-        if not enable_web:
-            raise SystemExit("--web-only requires web fallback (remove --no-web)")
-        return InvestigationEngine(
-            [],
-            enable_cache=True,
-            enable_web_fallback=True,
-            enable_web_sandbox=enable_web_sandbox,
-            enable_web_fetch=enable_web_fetch,
-            web_fetch_max_pages=web_fetch_pages,
-            enable_knowledge_library=enable_library,
-            knowledge_library_dir=Path(library_dir),
-        )
-
-    if args.build_dir:
-        engine = _load_engine_from_build(
-            Path(args.build_dir),
-            enable_knowledge_library=enable_library,
-            knowledge_library_dir=library_dir,
-            enable_web_fallback=enable_web,
-            enable_web_sandbox=enable_web_sandbox,
-            enable_web_fetch=enable_web_fetch,
-            web_fetch_max_pages=web_fetch_pages,
-        )
-        return engine
-
-    docs = args.docs or []
-    if not docs:
-        # Web-first default: if no local corpus was provided, fall back to web-only engine.
-        if not enable_web:
-            raise SystemExit("tui requires --build-dir/--docs, or web search enabled (remove --no-web)")
-        return InvestigationEngine(
-            [],
-            enable_cache=True,
-            enable_web_fallback=True,
-            enable_web_sandbox=enable_web_sandbox,
-            enable_web_fetch=enable_web_fetch,
-            web_fetch_max_pages=web_fetch_pages,
-            enable_knowledge_library=enable_library,
-            knowledge_library_dir=Path(library_dir),
-        )
-    from .parser import DocumentParser, parse_documents
-
-    units = parse_documents(docs, parser=DocumentParser())
     return InvestigationEngine(
-        units,
+        [],
         enable_cache=True,
-        enable_web_fallback=enable_web,
+        enable_web_fallback=True,
         enable_web_sandbox=enable_web_sandbox,
         enable_web_fetch=enable_web_fetch,
         web_fetch_max_pages=web_fetch_pages,
         enable_knowledge_library=enable_library,
         knowledge_library_dir=Path(library_dir),
     )
-
-
-def _load_engine_from_build(
-    build_dir: Path,
-    *,
-    enable_knowledge_library: bool,
-    knowledge_library_dir: str | Path,
-    enable_web_fallback: bool,
-    enable_web_sandbox: bool,
-    enable_web_fetch: bool,
-    web_fetch_max_pages: int,
-) :
-    from .engine import InvestigationEngine
-    from .index_ann import load_index
-    from .offline import load_bm25_from_build, load_sharded_bm25_indices
-
-    manifest_path = build_dir / "manifest.json"
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"manifest.json not found: {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    shard_count = int(manifest.get("shard_count", 1))
-    build_id = manifest.get("knowledge_build_id") or manifest.get("build_id")
-    embedding_model = str(manifest.get("embedding_model") or "intfloat/multilingual-e5-small")
-
-    if shard_count > 1 and (build_dir / "shards").exists():
-        shard_meta = manifest.get("shards", [])
-        ann_shards = []
-        all_units: list[Any] = []
-        for shard in shard_meta:
-            shard_dir = build_dir / shard["path"]
-            units = _load_units(shard_dir / "evidence_units.json")
-            all_units.extend(units)
-            ann_backend = shard.get("ann_backend", "empty")
-            ann_meta_path = shard_dir / "ann_index.meta.json"
-            if ann_backend == "empty" or not ann_meta_path.exists():
-                ann_shards.append(None)
-            else:
-                ann_suffix = ".npy" if ann_backend == "exact" else ".bin"
-                ann_index_path = shard_dir / f"ann_index{ann_suffix}"
-                ann_shards.append(load_index(ann_index_path, ann_meta_path))
-
-        bm25_shards = load_sharded_bm25_indices(build_dir)
-        return InvestigationEngine(
-            all_units,
-            build_id=build_id,
-            shard_count=shard_count,
-            ann_shards=ann_shards,
-            bm25_shards=bm25_shards,
-            embedding_model=embedding_model,
-            enable_web_fallback=enable_web_fallback,
-            enable_web_sandbox=enable_web_sandbox,
-            enable_web_fetch=enable_web_fetch,
-            web_fetch_max_pages=web_fetch_max_pages,
-            enable_knowledge_library=enable_knowledge_library,
-            knowledge_library_dir=Path(knowledge_library_dir),
-        )
-
-    # Single shard.
-    units = _load_units(build_dir / "evidence_units.json")
-    bm25 = load_bm25_from_build(build_dir)
-    ann_meta_path = build_dir / "ann_index.meta.json"
-    ann_backend = manifest.get("ann_backend", "hnsw")
-    ann_suffix = ".npy" if ann_backend == "exact" else ".bin"
-    ann_index_path = build_dir / f"ann_index{ann_suffix}"
-    ann = load_index(ann_index_path, ann_meta_path) if ann_meta_path.exists() else None
-
-    return InvestigationEngine(
-        units,
-        build_id=build_id,
-        shard_count=1,
-        ann_index=ann,
-        bm25_index=bm25,
-        embedding_model=embedding_model,
-        enable_web_fallback=enable_web_fallback,
-        enable_web_sandbox=enable_web_sandbox,
-        enable_web_fetch=enable_web_fetch,
-        web_fetch_max_pages=web_fetch_max_pages,
-        enable_knowledge_library=enable_knowledge_library,
-        knowledge_library_dir=Path(knowledge_library_dir),
-    )
-
-
-def _load_units(path: Path) -> list[Any]:
-    from .schema import EvidenceUnit, SourceType
-
-    raw_units = json.loads(path.read_text(encoding="utf-8"))
-    return [
-        EvidenceUnit(
-            doc_id=row["doc_id"],
-            source_type=SourceType(row["source_type"]),
-            content=row["content"],
-            section_path=row["section_path"],
-            char_start=int(row["char_start"]),
-            char_end=int(row["char_end"]),
-            timestamp=row["timestamp"],
-            confidence=float(row["confidence"]),
-            metadata=row.get("metadata", {}),
-        )
-        for row in raw_units
-    ]
 
 
 def _existing(root: Path | None, *names: str) -> list[Path]:
@@ -396,10 +232,3 @@ def _existing(root: Path | None, *names: str) -> list[Path]:
             paths.append(p)
     return paths
 
-
-def _needs_docparse(docs: Sequence[str]) -> bool:
-    for raw in docs:
-        ext = Path(raw).suffix.lower()
-        if ext in {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}:
-            return True
-    return False
