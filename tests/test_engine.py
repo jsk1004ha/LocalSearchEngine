@@ -24,6 +24,57 @@ from investigation_search.schema import EvidenceUnit, SourceType, Verdict
 from investigation_search.viewer import render_result_text
 from investigation_search.websearch import WebSearchResult
 
+from investigation_search.webfetch import _html_to_text, fetch_urls, WebFetchedPage
+
+
+def test_html_to_text_extracts_same_host_links() -> None:
+    html = """
+    <html><head><title>Sample</title></head>
+    <body>
+      <a href="/docs/a.pdf">A</a>
+      <a href="https://example.com/b">B</a>
+      <a href="https://other.com/c">C</a>
+      <p>Hello world</p>
+    </body></html>
+    """
+    text, title, links = _html_to_text(html, base_url="https://example.com/start")
+    assert title == "Sample"
+    assert "Hello" in text
+    assert "https://example.com/docs/a.pdf" in links
+    assert "https://example.com/b" in links
+    assert all("other.com" not in u for u in links)
+
+
+def test_fetch_urls_preserves_input_order_with_parallel_fetch() -> None:
+    urls = ["https://a.example.com", "https://b.example.com", "https://c.example.com"]
+
+    def fake_fetch_one(raw_url: str, **kwargs):
+        return WebFetchedPage(
+            url=raw_url,
+            final_url=raw_url,
+            status=200,
+            content_type="text/plain",
+            title=raw_url,
+            text="ok",
+            bytes_read=2,
+            truncated=False,
+        )
+
+    with patch("investigation_search.webfetch._fetch_one", side_effect=fake_fetch_one):
+        pages = fetch_urls(
+            urls,
+            timeout_sec=1.0,
+            user_agent="ua",
+            max_bytes=1024,
+            max_text_chars=1000,
+            max_redirects=1,
+            max_pages=3,
+            allow_pdf=False,
+            max_workers=3,
+        )
+
+    assert [p.url for p in pages] == urls
+
 
 def _sample_units() -> list[EvidenceUnit]:
     return [

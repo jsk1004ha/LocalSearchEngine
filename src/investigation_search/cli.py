@@ -22,6 +22,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_tui.add_argument("--no-web-sandbox", action="store_true", help="disable subprocess isolation for web search")
     p_tui.add_argument("--web-fetch", action="store_true", help="fetch and parse result pages (HTML/PDF) to create richer evidence")
     p_tui.add_argument("--web-fetch-pages", type=int, default=4, help="max pages to fetch per query")
+    p_tui.add_argument("--web-fetch-crawl-depth", type=int, default=0, help="extra in-site crawl depth from fetched pages (0~2)")
+    p_tui.add_argument("--web-fetch-workers", type=int, default=4, help="parallel workers for web page fetch")
     p_tui.add_argument(
         "--auto-install",
         action="store_true",
@@ -209,6 +211,8 @@ def _load_engine_for_tui(args: argparse.Namespace):
     enable_web_sandbox = not bool(getattr(args, "no_web_sandbox", False))
     enable_web_fetch = bool(getattr(args, "web_fetch", False))
     web_fetch_pages = int(getattr(args, "web_fetch_pages", 4) or 0)
+    web_fetch_crawl_depth = int(getattr(args, "web_fetch_crawl_depth", 0) or 0)
+    web_fetch_workers = int(getattr(args, "web_fetch_workers", 4) or 0)
 
     return InvestigationEngine(
         [],
@@ -217,6 +221,8 @@ def _load_engine_for_tui(args: argparse.Namespace):
         enable_web_sandbox=enable_web_sandbox,
         enable_web_fetch=enable_web_fetch,
         web_fetch_max_pages=web_fetch_pages,
+        web_fetch_crawl_depth=web_fetch_crawl_depth,
+        web_fetch_max_workers=max(1, web_fetch_workers),
         enable_knowledge_library=enable_library,
         knowledge_library_dir=Path(library_dir),
     )

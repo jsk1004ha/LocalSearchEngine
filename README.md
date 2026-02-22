@@ -6,7 +6,7 @@
 ## TL;DR
 
 - DuckDuckGo 기반 **웹 멀티패스 하이브리드 검색**
-- (옵션) 결과 URL 페이지 본문 fetch(HTML/PDF)
+- (옵션) 결과 URL 페이지 본문 fetch(HTML/PDF/이미지 OCR) + 사이트 내부 링크 크롤
 - 모든 결과에 `SourceCitation` 포함
 - 모순(contradiction) 단계 + reranker + explain/diagnostics
 - 지식도서관(Knowledge Library) 저장/내보내기/게시 지원
@@ -53,6 +53,8 @@ python -m investigation_search tui --web-fetch --enable-knowledge-library
 - `--no-web-sandbox`: 웹 검색 서브프로세스 격리 비활성화
 - `--web-fetch`: 검색 결과 페이지 본문 fetch 활성화
 - `--web-fetch-pages`: fetch 페이지 수 제한
+- `--web-fetch-crawl-depth`: 사이트 내부 링크 추가 크롤 깊이(0~2)
+- `--web-fetch-workers`: 웹 페이지 fetch 병렬 워커 수
 
 ### Knowledge Library
 
