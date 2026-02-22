@@ -17,6 +17,7 @@ class SearchMode(str, Enum):
     SNIPER = "sniper"
     RUMOR = "rumor"
     LIBRARY = "library"
+    LLM = "llm"
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,8 @@ _MODE_ALIASES = {
     "rumor": SearchMode.RUMOR,
     "gossip": SearchMode.RUMOR,
     "library": SearchMode.LIBRARY,
+    "llm": SearchMode.LLM,
+    "rag": SearchMode.LLM,
     # Korean
     "조사": SearchMode.INVESTIGATION,
     "조사모드": SearchMode.INVESTIGATION,
@@ -62,6 +65,9 @@ _MODE_ALIASES = {
     "찌라시모드": SearchMode.RUMOR,
     "도서관": SearchMode.LIBRARY,
     "도서관모드": SearchMode.LIBRARY,
+    "llm모드": SearchMode.LLM,
+    "심층": SearchMode.LLM,
+    "심층분석": SearchMode.LLM,
     "fbi모드": SearchMode.FBI,
     "osint모드": SearchMode.FBI,
 }
@@ -108,7 +114,7 @@ def profile_for_mode(mode: SearchMode) -> ModeProfile:
             retrieval_options_overrides={"enable_recency_boost": True},
         )
 
-    if mode == SearchMode.FBI:
+    if mode in {SearchMode.FBI, SearchMode.LLM}:
         return ModeProfile(
             mode=mode,
             description="OSINT-focused deep collection + link/timeline artifacts (public sources only).",
@@ -153,6 +159,21 @@ def profile_for_mode(mode: SearchMode) -> ModeProfile:
             retrieval_options_overrides={},
         )
 
+
+    if mode == SearchMode.LLM:
+        return ModeProfile(
+            mode=mode,
+            description="Local LLM deep-analysis mode (query planning + multi-source retrieval + synthesis).",
+            top_k_per_pass_min=10,
+            max_rerank_candidates=100,
+            always_web_search=True,
+            enable_web_fallback=True,
+            web_max_results=12,
+            web_score_base=0.62,
+            enable_web_fetch=True,
+            web_fetch_max_pages=8,
+            retrieval_options_overrides={"enable_recency_boost": True},
+        )
     if mode == SearchMode.LIBRARY:
         # Prefer trusted sources only while keeping web-first behavior.
         return ModeProfile(
@@ -192,7 +213,7 @@ def build_passes_for_mode(query: str, mode: SearchMode) -> Sequence[QueryPass]:
     def _add(name: str, suffix: str) -> None:
         base.append(QueryPass(name=name, query=f"{query} {suffix}".strip()))
 
-    if mode in {SearchMode.REPORTER, SearchMode.FBI, SearchMode.COLLECTION, SearchMode.RUMOR}:
+    if mode in {SearchMode.REPORTER, SearchMode.FBI, SearchMode.COLLECTION, SearchMode.RUMOR, SearchMode.LLM}:
         if lang == "en":
             _add("pass_d_background", "overview background context history")
             _add("pass_e_sources", "report analysis data evidence")
@@ -206,7 +227,7 @@ def build_passes_for_mode(query: str, mode: SearchMode) -> Sequence[QueryPass]:
         else:
             _add("pass_f_assets", "데이터셋 깃허브 arxiv 논문 pdf 리포지토리 이미지")
 
-    if mode == SearchMode.FBI:
+    if mode in {SearchMode.FBI, SearchMode.LLM}:
         if lang == "en":
             _add("pass_f_osint", "metadata robots sitemap cache archive")
             _add("pass_g_security_docs", "security advisory vulnerability disclosure cve")

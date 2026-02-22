@@ -538,3 +538,23 @@ def test_subprocess_sandbox_web_provider_parses_json() -> None:
         rows = provider.search("hello", max_results=2)
         assert rows
         assert rows[0].url == "https://example.com/a"
+
+
+def test_parse_mode_llm_alias() -> None:
+    from investigation_search.modes import SearchMode, parse_mode
+
+    assert parse_mode("llm") == SearchMode.LLM
+    assert parse_mode("심층분석") == SearchMode.LLM
+
+
+def test_free_osint_search_provider_delegates_to_searxng() -> None:
+    from investigation_search.websearch import FreeOSINTSearchProvider, SearxNGSearchProvider
+
+    provider = FreeOSINTSearchProvider()
+    with patch.object(SearxNGSearchProvider, "search", return_value=[
+        WebSearchResult(title="Example", url="https://example.com", snippet="snippet", rank=1, provider="searxng")
+    ]):
+        rows = provider.search("test query", max_results=3)
+
+    assert rows
+    assert rows[0].provider == "searxng"

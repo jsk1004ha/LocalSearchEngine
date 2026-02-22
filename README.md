@@ -5,7 +5,7 @@
 
 ## TL;DR
 
-- DuckDuckGo 기반 **웹 멀티패스 하이브리드 검색**
+- SearxNG 기반 **웹 멀티패스 하이브리드 검색** (로컬 무료 메타서치)
 - (옵션) 결과 URL 페이지 본문 fetch(HTML/PDF/이미지 OCR) + 사이트 내부 링크 크롤
 - 모든 결과에 `SourceCitation` 포함
 - 모순(contradiction) 단계 + reranker + explain/diagnostics
@@ -47,7 +47,7 @@ python -m investigation_search tui --web-fetch --enable-knowledge-library
 
 주요 옵션:
 
-- `--mode`: 검색 모드
+- `--mode`: 검색 모드 (`investigation`, `reporter`, `fbi`, `collection`, `rumor`, `library`, `llm`)
 - `--top-k`: 패스별 후보 수
 - `--time-budget`: 검색 시간 예산(초)
 - `--no-web-sandbox`: 웹 검색 서브프로세스 격리 비활성화
@@ -73,3 +73,12 @@ python -m investigation_search library publish --out artifacts/library_bundle.zi
 ## 라이선스
 
 MIT License. 자세한 내용은 `LICENSE`를 참고하세요.
+
+
+## 무료 OSINT 수집망 (유료 API 대체)
+
+- 기본 웹 검색: 로컬 SearxNG (`http://127.0.0.1:8080/search`)
+- 과거 데이터: Wayback Machine CDX API
+- 보안/서브도메인 조사: crt.sh / AlienVault OTX (확장용)
+- 차단 우회 fetch: Playwright(+stealth) 옵션 (`INVESTIGATION_USE_PLAYWRIGHT_FETCH=1`)
+- LLM 모드: Ollama 기반 쿼리 플래너 → 병렬 검색 → 근거 종합 답변 생성
