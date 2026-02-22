@@ -49,6 +49,7 @@ from .webfetch import (
     WebFetchedPage,
     chunk_text,
 )
+from .webapp import WebUiConfig, run_web_ui
 from .publisher import publish_knowledge_library_pdf, publish_knowledge_library_zip
 
 __all__ = [
@@ -134,6 +135,8 @@ __all__ = [
     "StdlibWebFetchProvider",
     "SubprocessSandboxWebFetchProvider",
     "chunk_text",
+    "WebUiConfig",
+    "run_web_ui",
     "SourceType",
     "Verdict",
     "publish_knowledge_library_zip",

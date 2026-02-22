@@ -33,6 +33,8 @@
   - [의존성 설치](#dependencies)
 - [사용법](#usage)
   - [TUI](#tui)
+  - [CLI 검색](#cli-search)
+  - [웹 UI](#web-ui)
   - [검색 모드](#modes)
   - [Knowledge Library](#knowledge-library)
 - [설정](#config)
@@ -124,6 +126,50 @@ python -m investigation_search tui --help
 - `--web-fetch-pages`: fetch 페이지 수 제한
 - `--web-fetch-crawl-depth`: 사이트 내부 링크 추가 크롤 깊이(0~2)
 - `--web-fetch-workers`: 웹 페이지 fetch 병렬 워커 수
+
+<a id="cli-search"></a>
+
+### CLI 검색
+
+```powershell
+$env:PYTHONPATH="src"
+python -m investigation_search search "오픈소스 LLM 최신 보안 이슈" --mode fbi --top-k 6 --time-budget 90
+```
+
+JSON 출력:
+
+```powershell
+python -m investigation_search search "한국 AI 정책 변화" --json --max-items 10
+```
+
+주요 옵션:
+
+- `--json`: 구조화된 JSON 출력
+- `--max-items`: 출력할 evidence/contradiction 최대 개수
+- `--no-diagnostics`: diagnostics 숨김
+- `--enable-knowledge-library`: 검색 세션 저장
+
+<a id="web-ui"></a>
+
+### 웹 UI
+
+브라우저에서 검색 UI를 실행합니다(스타일: Bento + Glassmorphism + Aurora).
+
+```powershell
+$env:PYTHONPATH="src"
+python -m investigation_search web --host 127.0.0.1 --port 8787 --mode investigation --web-fetch
+```
+
+접속 주소:
+
+- `http://127.0.0.1:8787/`
+
+주요 옵션:
+
+- `--title`: 페이지 제목
+- `--diagnostics-default`: diagnostics를 기본으로 펼침
+- `--top-k`, `--time-budget`, `--max-items`: 기본 검색 파라미터
+- `--web-fetch*`, `--enable-knowledge-library`: 엔진 동작 옵션
 
 <a id="modes"></a>
 

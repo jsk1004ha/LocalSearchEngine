@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .bootstrap import AUTO_INSTALL_ENV, auto_install_enabled, ensure_installed, repo_root
+from .result_payload import result_to_payload
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -14,17 +15,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_tui = sub.add_parser("tui", help="Run terminal UI (Textual)")
-    p_tui.add_argument("--mode", type=str, default="investigation", help="default mode (investigation/reporter/fbi/collection/rumor/library/llm)")
+    p_tui.add_argument("--mode", type=str, default="investigation", help=_mode_help("default"))
     p_tui.add_argument("--top-k", type=int, default=5, help="top_k_per_pass")
     p_tui.add_argument("--time-budget", type=int, default=120, help="time budget sec")
-    p_tui.add_argument("--knowledge-library-dir", type=str, default=str(Path("artifacts") / "knowledge_library"))
-    p_tui.add_argument("--enable-knowledge-library", action="store_true", help="persist searches to knowledge library")
-    p_tui.add_argument("--no-web-sandbox", action="store_true", help="disable subprocess isolation for web search")
-    p_tui.add_argument("--web-fetch", action="store_true", help="fetch and parse result pages (HTML/PDF) to create richer evidence")
-    p_tui.add_argument("--web-fetch-pages", type=int, default=4, help="max pages to fetch per query")
-    p_tui.add_argument("--web-fetch-crawl-depth", type=int, default=0, help="extra in-site crawl depth from fetched pages (0~2)")
-    p_tui.add_argument("--web-fetch-workers", type=int, default=4, help="parallel workers for web page fetch")
+    _add_runtime_engine_args(p_tui)
     p_tui.add_argument(
+        "--auto-install",
+        action="store_true",
+        help=f"auto install missing optional deps (also via env {AUTO_INSTALL_ENV}=1)",
+    )
+
+    p_search = sub.add_parser("search", help="Run one-shot search from CLI")
+    p_search.add_argument("query", type=str, help="search query")
+    p_search.add_argument("--mode", type=str, default="investigation", help=_mode_help("search"))
+    p_search.add_argument("--top-k", type=int, default=5, help="top_k_per_pass")
+    p_search.add_argument("--time-budget", type=int, default=120, help="time budget sec")
+    p_search.add_argument("--max-items", type=int, default=8, help="max evidence items to print/output")
+    p_search.add_argument("--json", action="store_true", help="emit JSON payload")
+    p_search.add_argument("--no-diagnostics", action="store_true", help="hide diagnostics from output")
+    _add_runtime_engine_args(p_search)
+    p_search.add_argument(
+        "--auto-install",
+        action="store_true",
+        help=f"auto install missing optional deps (also via env {AUTO_INSTALL_ENV}=1)",
+    )
+
+    p_web = sub.add_parser("web", help="Run browser web UI")
+    p_web.add_argument("--host", type=str, default="127.0.0.1")
+    p_web.add_argument("--port", type=int, default=8787)
+    p_web.add_argument("--title", type=str, default="Investigation Search Web")
+    p_web.add_argument("--mode", type=str, default="investigation", help=_mode_help("default"))
+    p_web.add_argument("--top-k", type=int, default=5, help="default top_k_per_pass")
+    p_web.add_argument("--time-budget", type=int, default=120, help="default time budget sec")
+    p_web.add_argument("--max-items", type=int, default=8, help="default max evidence cards")
+    p_web.add_argument("--diagnostics-default", action="store_true", help="show diagnostics by default in UI")
+    _add_runtime_engine_args(p_web)
+    p_web.add_argument(
         "--auto-install",
         action="store_true",
         help=f"auto install missing optional deps (also via env {AUTO_INSTALL_ENV}=1)",
@@ -71,20 +97,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    if args.cmd == "tui":
+    if args.cmd in {"tui", "search", "web"}:
         auto_install = bool(getattr(args, "auto_install", False)) or auto_install_enabled()
         if auto_install:
-            root = repo_root()
-            reqs = ["requirements-core.txt", "requirements-tui.txt"]
-            fallback_pkgs = ("numpy", "textual")
-            ensure_installed(
-                requirements_files=_existing(root, *reqs),
-                packages=fallback_pkgs,
-                auto_install=True,
-                quiet=False,
-            )
+            _ensure_runtime_dependencies(args.cmd)
 
-        engine = _load_engine_for_tui(args)
+    if args.cmd == "tui":
+        engine = _load_engine_for_runtime(args)
         from .tui import run_tui  # lazy import (optional dep: textual)
 
         run_tui(
@@ -92,6 +111,65 @@ def main(argv: Sequence[str] | None = None) -> int:
             default_mode=args.mode,
             top_k_per_pass=args.top_k,
             time_budget_sec=args.time_budget,
+        )
+        return 0
+
+    if args.cmd == "search":
+        engine = _load_engine_for_runtime(args)
+        result = engine.search(
+            args.query,
+            top_k_per_pass=max(1, int(args.top_k)),
+            time_budget_sec=max(1, int(args.time_budget)),
+            mode=args.mode,
+        )
+        include_diagnostics = not bool(args.no_diagnostics)
+        if bool(args.json):
+            payload = result_to_payload(
+                result,
+                query=args.query,
+                mode=str(args.mode),
+                top_k_per_pass=max(1, int(args.top_k)),
+                time_budget_sec=max(1, int(args.time_budget)),
+                max_items=max(0, int(args.max_items)),
+                include_diagnostics=include_diagnostics,
+            )
+            session_id = result.diagnostics.get("knowledge_library_session_id")
+            if session_id:
+                payload["knowledge_library_session_id"] = session_id
+            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+
+        from .viewer import render_result_text
+
+        print(
+            render_result_text(
+                result,
+                query=args.query,
+                max_items=max(0, int(args.max_items)),
+                include_diagnostics=include_diagnostics,
+            )
+        )
+        session_id = result.diagnostics.get("knowledge_library_session_id")
+        if session_id:
+            print(f"\nSaved session: {session_id}")
+        return 0
+
+    if args.cmd == "web":
+        engine = _load_engine_for_runtime(args)
+        from .webapp import WebUiConfig, run_web_ui
+
+        run_web_ui(
+            engine,
+            host=str(args.host),
+            port=max(1, int(args.port)),
+            config=WebUiConfig(
+                title=str(args.title),
+                default_mode=str(args.mode),
+                default_top_k=max(1, int(args.top_k)),
+                default_time_budget_sec=max(1, int(args.time_budget)),
+                default_max_items=max(1, int(args.max_items)),
+                default_show_diagnostics=bool(args.diagnostics_default),
+            ),
         )
         return 0
 
@@ -203,7 +281,7 @@ def _serve_dir(directory: Path, *, host: str, port: int) -> None:
             pass
 
 
-def _load_engine_for_tui(args: argparse.Namespace):
+def _load_engine_for_runtime(args: argparse.Namespace):
     from .engine import InvestigationEngine
 
     enable_library = bool(getattr(args, "enable_knowledge_library", False))
@@ -226,6 +304,35 @@ def _load_engine_for_tui(args: argparse.Namespace):
         enable_knowledge_library=enable_library,
         knowledge_library_dir=Path(library_dir),
     )
+
+
+def _add_runtime_engine_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--knowledge-library-dir", type=str, default=str(Path("artifacts") / "knowledge_library"))
+    parser.add_argument("--enable-knowledge-library", action="store_true", help="persist searches to knowledge library")
+    parser.add_argument("--no-web-sandbox", action="store_true", help="disable subprocess isolation for web search")
+    parser.add_argument("--web-fetch", action="store_true", help="fetch and parse result pages (HTML/PDF) to create richer evidence")
+    parser.add_argument("--web-fetch-pages", type=int, default=4, help="max pages to fetch per query")
+    parser.add_argument("--web-fetch-crawl-depth", type=int, default=0, help="extra in-site crawl depth from fetched pages (0~2)")
+    parser.add_argument("--web-fetch-workers", type=int, default=4, help="parallel workers for web page fetch")
+
+
+def _ensure_runtime_dependencies(cmd: str) -> None:
+    root = repo_root()
+    reqs = ["requirements-core.txt"]
+    fallback_pkgs = ("numpy",)
+    if cmd == "tui":
+        reqs.append("requirements-tui.txt")
+        fallback_pkgs = ("numpy", "textual")
+    ensure_installed(
+        requirements_files=_existing(root, *reqs),
+        packages=fallback_pkgs,
+        auto_install=True,
+        quiet=False,
+    )
+
+
+def _mode_help(prefix: str) -> str:
+    return f"{prefix} mode (investigation/reporter/fbi/collection/sniper/rumor/library/llm)"
 
 
 def _existing(root: Path | None, *names: str) -> list[Path]:
