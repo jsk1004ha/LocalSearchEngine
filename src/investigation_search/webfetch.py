@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import io
 import ipaddress
 import os
@@ -581,6 +582,72 @@ def _is_public_ip(ip: ipaddress._BaseAddress) -> bool:
     except Exception:
         return True
 
+
+
+
+@dataclass(frozen=True)
+class PlaywrightStealthWebFetchProvider:
+    provider_name: str = "playwright-stealth-webfetch"
+    timeout_sec: float = 20.0
+    max_text_chars: int = 180_000
+
+    def fetch(self, urls: Sequence[str] | Iterable[str], *, max_pages: int = 5) -> List[WebFetchedPage]:
+        seq = [str(u).strip() for u in list(urls)]
+        seq = [u for u in seq if u][: max(0, int(max_pages))]
+        if not seq:
+            return []
+        script = """
+import asyncio, json
+from playwright.async_api import async_playwright
+
+URLS = json.loads({urls_json})
+
+async def run():
+    out = []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
+        for u in URLS:
+            try:
+                await page.goto(u, wait_until='domcontentloaded', timeout={timeout_ms})
+                txt = await page.evaluate('document.body ? document.body.innerText : ""')
+                title = await page.title()
+                out.append({{"url": u, "final_url": page.url, "status": 200, "content_type": "text/html", "title": title, "text": txt[:{max_chars}], "bytes_read": len(txt.encode('utf-8')), "truncated": len(txt)>{max_chars}, "discovered_links": [], "error": None}})
+            except Exception as e:
+                out.append({{"url": u, "final_url": u, "status": None, "content_type": "", "title": "", "text": "", "bytes_read": 0, "truncated": False, "discovered_links": [], "error": f"fetch_error:{{type(e).__name__}}"}})
+        await browser.close()
+    print(json.dumps({{"ok": True, "pages": out}}, ensure_ascii=False))
+
+asyncio.run(run())
+"""
+        code = script.format(urls_json=repr(json.dumps(seq)), timeout_ms=int(max(1.0, float(self.timeout_sec))*1000), max_chars=int(self.max_text_chars))
+        try:
+            proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=max(2.0, float(self.timeout_sec)+5.0))
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("playwright_fetch_timeout")
+        raw = (proc.stdout or "").strip()
+        if not raw:
+            raise RuntimeError("playwright_fetch_no_output")
+        payload = json.loads(raw)
+        pages = payload.get("pages", []) if isinstance(payload, dict) else []
+        out: list[WebFetchedPage] = []
+        for row in pages:
+            if not isinstance(row, dict):
+                continue
+            out.append(WebFetchedPage(
+                url=str(row.get("url", "")),
+                final_url=str(row.get("final_url", "")),
+                status=int(row.get("status", 0) or 0) or None,
+                content_type=str(row.get("content_type", "")),
+                title=str(row.get("title", "")),
+                text=str(row.get("text", "")),
+                bytes_read=int(row.get("bytes_read", 0) or 0),
+                truncated=bool(row.get("truncated", False)),
+                discovered_links=tuple(str(u) for u in (row.get("discovered_links") or [])),
+                error=row.get("error"),
+            ))
+        return out
 
 @dataclass(frozen=True)
 class SubprocessSandboxWebFetchProvider:

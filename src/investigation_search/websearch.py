@@ -64,6 +64,82 @@ class DuckDuckGoSearchProvider:
         return f"{self.endpoint}?{params}"
 
 
+@dataclass(frozen=True)
+class SearxNGSearchProvider:
+    provider_name: str = "searxng"
+    endpoint: str = "http://127.0.0.1:8080/search"
+    timeout_sec: float = 12.0
+    user_agent: str = "Mozilla/5.0 (compatible; LocalInvestigationSearch/0.1)"
+
+    def search(self, query: str, *, max_results: int = 5) -> List[WebSearchResult]:
+        clean_query = str(query or "").strip()
+        if not clean_query or max_results <= 0:
+            return []
+        params = urllib.parse.urlencode({"q": clean_query, "format": "json", "language": "auto"})
+        url = f"{self.endpoint}?{params}"
+        request = urllib.request.Request(url=url, headers={"User-Agent": self.user_agent, "Accept": "application/json"})
+        with urllib.request.urlopen(request, timeout=self.timeout_sec) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        rows = payload.get("results", []) if isinstance(payload, dict) else []
+        out: list[WebSearchResult] = []
+        for idx, row in enumerate(rows[: max(0, int(max_results))], start=1):
+            if not isinstance(row, dict):
+                continue
+            title = _clean_html(str(row.get("title", "")))
+            url = str(row.get("url", "")).strip()
+            snippet = _clean_html(str(row.get("content", "")))
+            if not title or not url:
+                continue
+            out.append(WebSearchResult(title=title, url=url, snippet=snippet, rank=idx, provider=self.provider_name))
+        return out
+
+
+@dataclass(frozen=True)
+class FreeOSINTSearchProvider:
+    provider_name: str = "free-osint"
+    timeout_sec: float = 12.0
+    user_agent: str = "Mozilla/5.0 (compatible; LocalInvestigationSearch/0.1)"
+    searxng_endpoint: str = "http://127.0.0.1:8080/search"
+    alienvault_api_key: str = ""
+
+    def search(self, query: str, *, max_results: int = 5) -> List[WebSearchResult]:
+        searx = SearxNGSearchProvider(
+            endpoint=self.searxng_endpoint,
+            timeout_sec=self.timeout_sec,
+            user_agent=self.user_agent,
+        )
+        rows = searx.search(query, max_results=max_results)
+        return rows
+
+    def search_wayback(self, query_or_url: str, *, max_results: int = 3) -> List[WebSearchResult]:
+        target = str(query_or_url or "").strip()
+        if not target:
+            return []
+        encoded = urllib.parse.quote(target, safe="")
+        url = f"https://web.archive.org/cdx/search/cdx?url={encoded}&output=json&fl=timestamp,original,statuscode&filter=statuscode:200&limit={max_results}"
+        req = urllib.request.Request(url=url, headers={"User-Agent": self.user_agent})
+        with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        if not isinstance(payload, list) or len(payload) <= 1:
+            return []
+        out: list[WebSearchResult] = []
+        for idx, row in enumerate(payload[1:], start=1):
+            if not isinstance(row, list) or len(row) < 2:
+                continue
+            ts, original = str(row[0]), str(row[1])
+            archive_url = f"https://web.archive.org/web/{ts}/{original}"
+            out.append(
+                WebSearchResult(
+                    title=f"Wayback snapshot {ts}",
+                    url=archive_url,
+                    snippet=original,
+                    rank=idx,
+                    provider="wayback",
+                )
+            )
+        return out
+
+
 def _parse_duckduckgo_html(raw_html: str, *, provider: str, max_results: int) -> List[WebSearchResult]:
     link_rows = list(_RESULT_RE.finditer(raw_html))
     snippets = [m.group("snippet") for m in _SNIPPET_RE.finditer(raw_html)]
@@ -104,25 +180,17 @@ def to_evidence_content(results: Sequence[WebSearchResult] | Iterable[WebSearchR
 
 @dataclass(frozen=True)
 class SubprocessSandboxWebSearchProvider:
-    """Run DuckDuckGo search in a separate Python process.
-
-    This is best-effort isolation:
-    - Process boundary for parsing/network code
-    - Timeout + max_bytes on response
-    - Does NOT guarantee OS-level sandboxing; use VM/Docker/Windows Sandbox for stronger isolation.
-    """
-
-    provider_name: str = "duckduckgo-subprocess"
+    provider_name: str = "free-osint-subprocess"
     timeout_sec: float = 14.0
     max_bytes: int = 1_500_000
-    endpoint: str = "https://duckduckgo.com/html/"
+    endpoint: str = "http://127.0.0.1:8080/search"
     user_agent: str = "Mozilla/5.0 (compatible; LocalInvestigationSearch/0.1)"
+    provider_kind: str = "free-osint"
 
     def search(self, query: str, *, max_results: int = 5) -> List[WebSearchResult]:
         clean_query = str(query or "").strip()
         if not clean_query or max_results <= 0:
             return []
-
         cmd = [
             sys.executable,
             "-m",
@@ -139,38 +207,28 @@ class SubprocessSandboxWebSearchProvider:
             self.endpoint,
             "--user-agent",
             self.user_agent,
+            "--provider-kind",
+            self.provider_kind,
         ]
-
         env = os.environ.copy()
         env.setdefault("PYTHONNOUSERSITE", "1")
         _ensure_worker_pythonpath(env)
-
-        try:
-            proc = subprocess.run(
-                cmd,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=max(1.0, float(self.timeout_sec) + 3.0),
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("websearch_worker_timeout")
-
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=max(1.0, float(self.timeout_sec) + 3.0),
+            env=env,
+        )
         raw = (proc.stdout or "").strip()
         if not raw:
             err = (proc.stderr or "").strip()
             raise RuntimeError(f"websearch_worker_no_output rc={proc.returncode} stderr={err[:180]}")
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            raise RuntimeError("websearch_worker_invalid_json")
+        payload = json.loads(raw)
         if not isinstance(payload, dict) or not payload.get("ok"):
             raise RuntimeError(str(payload.get("error") or "websearch_worker_error"))
         results = payload.get("results", [])
-        if not isinstance(results, list):
-            return []
-
         out: list[WebSearchResult] = []
         for row in results:
             if not isinstance(row, dict):
@@ -188,9 +246,8 @@ class SubprocessSandboxWebSearchProvider:
 
 
 def _ensure_worker_pythonpath(env: dict) -> None:
-    # When running from a repo checkout, ensure the subprocess can import from `src`.
     here = Path(__file__).resolve()
-    src_dir = str(here.parents[1])  # .../src
+    src_dir = str(here.parents[1])
     current = env.get("PYTHONPATH", "")
     parts = [p for p in current.split(os.pathsep) if p]
     if src_dir not in parts:

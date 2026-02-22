@@ -14,7 +14,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_tui = sub.add_parser("tui", help="Run terminal UI (Textual)")
-    p_tui.add_argument("--mode", type=str, default="investigation", help="default mode (investigation/report/fbi/...)")
+    p_tui.add_argument("--mode", type=str, default="investigation", help="default mode (investigation/reporter/fbi/collection/rumor/library/llm)")
     p_tui.add_argument("--top-k", type=int, default=5, help="top_k_per_pass")
     p_tui.add_argument("--time-budget", type=int, default=120, help="time budget sec")
     p_tui.add_argument("--knowledge-library-dir", type=str, default=str(Path("artifacts") / "knowledge_library"))

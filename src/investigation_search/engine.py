@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import time
 from collections import defaultdict
 from collections import OrderedDict
@@ -19,6 +20,7 @@ from .library import KnowledgeLibrary
 from .learning import LearningConfig, OnlineLearningManager
 from .modes import SearchMode, build_passes_for_mode, parse_mode, profile_for_mode
 from .osint import build_osint_graph, extract_timeline
+from .ollama import OllamaClient
 from .reranker import LocalCrossEncoderReranker, Reranker
 from .retrieval import (
     QueryPass,
@@ -31,6 +33,7 @@ from .retrieval import (
 from .schema import EvidenceUnit, ScoredEvidence, SearchResult, SourceCitation, SourceType, Verdict, build_source_citation
 from .viewer import summarize_stage_scores
 from .webfetch import (
+    PlaywrightStealthWebFetchProvider,
     StdlibWebFetchProvider,
     SubprocessSandboxWebFetchProvider,
     WebFetchProvider,
@@ -134,7 +137,12 @@ class InvestigationEngine:
         if web_fetch_provider is not None:
             self.web_fetch_provider = web_fetch_provider
         else:
-            if enable_web_sandbox:
+            if os.environ.get("INVESTIGATION_USE_PLAYWRIGHT_FETCH", "0") == "1":
+                self.web_fetch_provider = PlaywrightStealthWebFetchProvider(
+                    timeout_sec=max(1.0, float(web_fetch_timeout_sec)),
+                    max_text_chars=max(0, int(web_fetch_max_text_chars)),
+                )
+            elif enable_web_sandbox:
                 self.web_fetch_provider = SubprocessSandboxWebFetchProvider(
                     timeout_sec=max(1.0, float(web_fetch_timeout_sec)),
                     max_bytes=max(0, int(web_fetch_max_bytes)),
@@ -240,7 +248,13 @@ class InvestigationEngine:
             "rrf": active_weights.rrf,
         }
 
-        passes = tuple(build_passes_for_mode(query_text, mode_enum))
+        if mode_enum == SearchMode.LLM:
+            planned_queries = self._plan_llm_queries(query_text)
+            pass_stats["llm"] = {"planned_queries": planned_queries}
+            passes = tuple(QueryPass(name=f"llm_plan_{idx+1}", query=q) for idx, q in enumerate(planned_queries))
+        else:
+            passes = tuple(build_passes_for_mode(query_text, mode_enum))
+
         for qp in passes:
             elapsed = time.time() - start
             remaining = time_budget_sec - elapsed
@@ -395,8 +409,18 @@ class InvestigationEngine:
         pass_stats["elapsed_sec"] = f"{end_ts - start:.3f}"
         pass_stats["time_budget_sec"] = str(time_budget_sec)
 
+        formatted_answer = self._format_answer_for_mode(
+            mode_enum,
+            answer=answer,
+            best=best,
+            supports=supports,
+            contradictions=contradictions,
+        )
+        if mode_enum == SearchMode.LLM:
+            formatted_answer = self._synthesize_llm_answer(query_text, best, fallback=formatted_answer)
+
         result = SearchResult(
-            answer=self._format_answer_for_mode(mode_enum, answer=answer, best=best, supports=supports, contradictions=contradictions),
+            answer=formatted_answer,
             evidence=best[:1] if mode_enum == SearchMode.SNIPER else best,
             contradictions=contradictions,
             diagnostics=pass_stats,
@@ -1127,6 +1151,47 @@ class InvestigationEngine:
             if domain and any(domain == td or domain.endswith("." + td) for td in self.trusted_domains):
                 trusted.append(item)
         return trusted
+
+    def _plan_llm_queries(self, query: str) -> list[str]:
+        prompt = (
+            "사용자 질문에 답하기 위한 웹 검색어 3개를 줄바꿈으로 생성하세요. "
+            "설명 없이 검색어만 출력하세요.\n"
+            f"질문: {query}"
+        )
+        try:
+            raw = OllamaClient().generate(model="llama3.1:8b", prompt=prompt)
+            lines = [line.strip(" -•	") for line in str(raw).splitlines()]
+            lines = [line for line in lines if line]
+            unique: list[str] = []
+            for line in lines:
+                if line not in unique:
+                    unique.append(line)
+                if len(unique) >= 3:
+                    break
+            if unique:
+                return unique
+        except Exception:
+            pass
+        return [query, f"{query} background", f"{query} evidence"]
+
+    def _synthesize_llm_answer(self, query: str, best: Sequence[ScoredEvidence], *, fallback: str) -> str:
+        if not best:
+            return fallback
+        evidence_lines: list[str] = []
+        for idx, item in enumerate(best[:10], start=1):
+            src = item.evidence.metadata.get("url") or item.evidence.doc_id
+            evidence_lines.append(f"[{idx}] {item.evidence.content}\nsource={src}")
+        prompt = (
+            "주어진 근거를 종합해 질문에 답하세요. "
+            "문장 끝에 반드시 [1], [2] 같은 번호 인용을 포함하세요.\n"
+            f"질문: {query}\n\n근거:\n" + "\n\n".join(evidence_lines)
+        )
+        try:
+            out = OllamaClient().generate(model="llama3.1:8b", prompt=prompt)
+            text = str(out).strip()
+            return text or fallback
+        except Exception:
+            return fallback
 
     def _persist_to_library(
         self,

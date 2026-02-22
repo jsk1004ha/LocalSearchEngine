@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 
-from .websearch import DuckDuckGoSearchProvider
+from .websearch import DuckDuckGoSearchProvider, FreeOSINTSearchProvider, SearxNGSearchProvider
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -15,14 +15,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-bytes", type=int, default=1_500_000)
     parser.add_argument("--endpoint", type=str, default="https://duckduckgo.com/html/")
     parser.add_argument("--user-agent", type=str, default="Mozilla/5.0 (compatible; LocalInvestigationSearch/0.1)")
+    parser.add_argument("--provider-kind", type=str, default="free-osint")
     args = parser.parse_args(argv)
 
-    provider = DuckDuckGoSearchProvider(
-        endpoint=args.endpoint,
-        timeout_sec=max(1.0, float(args.timeout_sec)),
-        user_agent=args.user_agent,
-        max_bytes=max(0, int(args.max_bytes)),
-    )
+    if args.provider_kind == "duckduckgo":
+        provider = DuckDuckGoSearchProvider(
+            endpoint=args.endpoint,
+            timeout_sec=max(1.0, float(args.timeout_sec)),
+            user_agent=args.user_agent,
+            max_bytes=max(0, int(args.max_bytes)),
+        )
+    elif args.provider_kind == "searxng":
+        provider = SearxNGSearchProvider(
+            endpoint=args.endpoint,
+            timeout_sec=max(1.0, float(args.timeout_sec)),
+            user_agent=args.user_agent,
+        )
+    else:
+        provider = FreeOSINTSearchProvider(
+            searxng_endpoint=args.endpoint,
+            timeout_sec=max(1.0, float(args.timeout_sec)),
+            user_agent=args.user_agent,
+        )
 
     try:
         results = provider.search(args.query, max_results=max(0, int(args.max_results)))
@@ -48,4 +62,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
