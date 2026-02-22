@@ -81,13 +81,13 @@ def profile_for_mode(mode: SearchMode) -> ModeProfile:
     if mode == SearchMode.SNIPER:
         return ModeProfile(
             mode=mode,
-            description="Only the single best evidence with minimal context.",
+            description="Online-first pinpoint mode: keep only the single strongest evidence with minimal context.",
             top_k_per_pass_min=1,
             max_rerank_candidates=12,
-            always_web_search=False,
-            enable_web_fallback=False,
-            web_max_results=0,
-            web_score_base=0.0,
+            always_web_search=True,
+            enable_web_fallback=True,
+            web_max_results=4,
+            web_score_base=0.58,
             enable_web_fetch=False,
             web_fetch_max_pages=0,
             retrieval_options_overrides={},
@@ -154,28 +154,28 @@ def profile_for_mode(mode: SearchMode) -> ModeProfile:
         )
 
     if mode == SearchMode.LIBRARY:
-        # Prefer trusted sources only: default is local corpus, web excluded unless explicitly allowed.
+        # Prefer trusted sources only while keeping web-first behavior.
         return ModeProfile(
             mode=mode,
-            description="Trusted-only aggregation (local corpus by default).",
+            description="Trusted-first aggregation from online sources.",
             top_k_per_pass_min=6,
             max_rerank_candidates=32,
-            always_web_search=False,
-            enable_web_fallback=False,
-            web_max_results=0,
-            web_score_base=0.0,
-            enable_web_fetch=False,
-            web_fetch_max_pages=0,
+            always_web_search=True,
+            enable_web_fallback=True,
+            web_max_results=5,
+            web_score_base=0.62,
+            enable_web_fetch=True,
+            web_fetch_max_pages=2,
             retrieval_options_overrides={"min_ocr_confidence": 0.55},
             include_only_trusted_sources=True,
         )
 
     return ModeProfile(
         mode=SearchMode.INVESTIGATION,
-        description="Investigation mode (answer + evidence + contradictions + diagnostics).",
+        description="Investigation mode (online-first answer + evidence + contradictions + diagnostics).",
         top_k_per_pass_min=5,
         max_rerank_candidates=32,
-        always_web_search=False,
+        always_web_search=True,
         enable_web_fallback=True,
         web_max_results=3,
         web_score_base=0.25,
