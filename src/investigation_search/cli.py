@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Sequence
 
-from .bootstrap import AUTO_INSTALL_ENV, auto_install_enabled, ensure_installed, repo_root
+from .bootstrap import AUTO_INSTALL_ENV, auto_install_enabled, ensure_installed, module_available, repo_root, requirements_path
 from .result_payload import result_to_payload
+from .tooling import build_runtime_tooling
+from .webfetch import Crawl4AIWebFetchProvider, PlaywrightStealthWebFetchProvider, StdlibWebFetchProvider, SubprocessSandboxWebFetchProvider
+
+
+class MissingDependencyError(RuntimeError):
+    """Raised when a runtime dependency required by the command is missing."""
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -56,6 +64,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=f"auto install missing optional deps (also via env {AUTO_INSTALL_ENV}=1)",
     )
 
+    p_build = sub.add_parser("build", help="Build a local evidence/index bundle from documents and optional URLs")
+    p_build.add_argument("--output-dir", type=str, required=True, help="directory to write the build artifacts")
+    p_build.add_argument("--document", action="append", default=[], help="local document path (repeatable)")
+    p_build.add_argument("--url", action="append", default=[], help="URL to crawl with Crawl4AI (repeatable)")
+    p_build.add_argument("--corpus-snapshot-id", type=str, default="runtime", help="logical corpus snapshot identifier")
+    p_build.add_argument("--embedding-model", type=str, default="sentence-transformers/all-MiniLM-L6-v2")
+    p_build.add_argument("--ann-backend", type=str, default="hnsw", choices=["hnsw", "exact"])
+    p_build.add_argument("--shard-count", type=int, default=1)
+    p_build.add_argument("--crawl-max-pages", type=int, default=5, help="max pages to ingest from URL inputs")
+    p_build.add_argument("--crawl-max-text-chars", type=int, default=180000)
+    p_build.add_argument("--crawl-fit-markdown", action="store_true", help="prefer fit_markdown from Crawl4AI")
+    p_build.add_argument(
+        "--auto-install",
+        action="store_true",
+        help=f"auto install missing optional deps (also via env {AUTO_INSTALL_ENV}=1)",
+    )
+
+    p_env = sub.add_parser("env-check", help="Report runtime dependency status and suggested install steps")
+    p_env.add_argument(
+        "--command",
+        type=str,
+        default="search",
+        choices=["search", "web", "tui", "build"],
+        help="which command profile to check",
+    )
+
     p_lib = sub.add_parser("library", help="Knowledge library utilities")
     lib_sub = p_lib.add_subparsers(dest="library_cmd", required=True)
 
@@ -97,81 +131,104 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    if args.cmd in {"tui", "search", "web"}:
+    if args.cmd in {"tui", "search", "web", "build"}:
         auto_install = bool(getattr(args, "auto_install", False)) or auto_install_enabled()
         if auto_install:
             _ensure_runtime_dependencies(args.cmd)
 
-    if args.cmd == "tui":
-        engine = _load_engine_for_runtime(args)
-        from .tui import run_tui  # lazy import (optional dep: textual)
-
-        run_tui(
-            engine,
-            default_mode=args.mode,
-            top_k_per_pass=args.top_k,
-            time_budget_sec=args.time_budget,
-        )
+    if args.cmd == "env-check":
+        _print_json(_collect_runtime_environment_report(command=str(args.command)))
         return 0
 
+    if args.cmd == "tui":
+        try:
+            engine = _load_engine_for_runtime(args)
+            from .tui import run_tui  # lazy import (optional dep: textual)
+
+            run_tui(
+                engine,
+                default_mode=args.mode,
+                top_k_per_pass=args.top_k,
+                time_budget_sec=args.time_budget,
+            )
+            return 0
+        except MissingDependencyError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
     if args.cmd == "search":
-        engine = _load_engine_for_runtime(args)
-        result = engine.search(
-            args.query,
-            top_k_per_pass=max(1, int(args.top_k)),
-            time_budget_sec=max(1, int(args.time_budget)),
-            mode=args.mode,
-        )
-        include_diagnostics = not bool(args.no_diagnostics)
-        if bool(args.json):
-            payload = result_to_payload(
-                result,
-                query=args.query,
-                mode=str(args.mode),
+        try:
+            engine = _load_engine_for_runtime(args)
+            result = engine.search(
+                args.query,
                 top_k_per_pass=max(1, int(args.top_k)),
                 time_budget_sec=max(1, int(args.time_budget)),
-                max_items=max(0, int(args.max_items)),
-                include_diagnostics=include_diagnostics,
+                mode=args.mode,
+            )
+            include_diagnostics = not bool(args.no_diagnostics)
+            if bool(args.json):
+                payload = result_to_payload(
+                    result,
+                    query=args.query,
+                    mode=str(args.mode),
+                    top_k_per_pass=max(1, int(args.top_k)),
+                    time_budget_sec=max(1, int(args.time_budget)),
+                    max_items=max(0, int(args.max_items)),
+                    include_diagnostics=include_diagnostics,
+                )
+                session_id = result.diagnostics.get("knowledge_library_session_id")
+                if session_id:
+                    payload["knowledge_library_session_id"] = session_id
+                _print_json(payload)
+                return 0
+
+            from .viewer import render_result_text
+
+            print(
+                render_result_text(
+                    result,
+                    query=args.query,
+                    max_items=max(0, int(args.max_items)),
+                    include_diagnostics=include_diagnostics,
+                )
             )
             session_id = result.diagnostics.get("knowledge_library_session_id")
             if session_id:
-                payload["knowledge_library_session_id"] = session_id
-            _print_json(payload)
+                print(f"\nSaved session: {session_id}")
             return 0
-
-        from .viewer import render_result_text
-
-        print(
-            render_result_text(
-                result,
-                query=args.query,
-                max_items=max(0, int(args.max_items)),
-                include_diagnostics=include_diagnostics,
-            )
-        )
-        session_id = result.diagnostics.get("knowledge_library_session_id")
-        if session_id:
-            print(f"\nSaved session: {session_id}")
-        return 0
+        except MissingDependencyError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
 
     if args.cmd == "web":
-        engine = _load_engine_for_runtime(args)
-        from .webapp import WebUiConfig, run_web_ui
+        try:
+            engine = _load_engine_for_runtime(args)
+            from .webapp import WebUiConfig, run_web_ui
 
-        run_web_ui(
-            engine,
-            host=str(args.host),
-            port=max(1, int(args.port)),
-            config=WebUiConfig(
-                title=str(args.title),
-                default_mode=str(args.mode),
-                default_top_k=max(1, int(args.top_k)),
-                default_time_budget_sec=max(1, int(args.time_budget)),
-                default_max_items=max(1, int(args.max_items)),
-                default_show_diagnostics=bool(args.diagnostics_default),
-            ),
-        )
-        return 0
+            run_web_ui(
+                engine,
+                host=str(args.host),
+                port=max(1, int(args.port)),
+                config=WebUiConfig(
+                    title=str(args.title),
+                    default_mode=str(args.mode),
+                    default_top_k=max(1, int(args.top_k)),
+                    default_time_budget_sec=max(1, int(args.time_budget)),
+                    default_max_items=max(1, int(args.max_items)),
+                    default_show_diagnostics=bool(args.diagnostics_default),
+                ),
+            )
+            return 0
+        except MissingDependencyError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
+    if args.cmd == "build":
+        try:
+            return _run_build_command(args)
+        except MissingDependencyError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
 
     if args.cmd == "library":
         lib_dir = Path(args.library_dir)
@@ -282,7 +339,11 @@ def _serve_dir(directory: Path, *, host: str, port: int) -> None:
 
 
 def _load_engine_for_runtime(args: argparse.Namespace):
-    from .engine import InvestigationEngine
+    try:
+        from .engine import InvestigationEngine
+        from .offline import load_bm25_from_build, load_build, load_sharded_bm25_indices, load_sharded_build
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise _as_missing_dependency_error(exc, command="runtime search")
 
     enable_library = bool(getattr(args, "enable_knowledge_library", False))
     library_dir = getattr(args, "knowledge_library_dir", str(Path("artifacts") / "knowledge_library"))
@@ -291,9 +352,57 @@ def _load_engine_for_runtime(args: argparse.Namespace):
     web_fetch_pages = int(getattr(args, "web_fetch_pages", 4) or 0)
     web_fetch_crawl_depth = int(getattr(args, "web_fetch_crawl_depth", 0) or 0)
     web_fetch_workers = int(getattr(args, "web_fetch_workers", 4) or 0)
+    tooling = build_runtime_tooling(
+        web_fetch_backend=str(getattr(args, "web_fetch_backend", "default") or "default"),
+        pii_redaction_backend=str(getattr(args, "pii_redaction", "off") or "off"),
+        graph_backend=str(getattr(args, "graph_backend", "off") or "off"),
+        neo4j_uri=str(getattr(args, "neo4j_uri", "") or ""),
+        neo4j_user=str(getattr(args, "neo4j_user", "") or ""),
+        neo4j_password=str(getattr(args, "neo4j_password", "") or ""),
+        neo4j_database=str(getattr(args, "neo4j_database", "") or ""),
+    )
+    web_fetch_provider = _resolve_web_fetch_provider(
+        tooling.web_fetch_backend,
+        web_fetch_workers=max(1, web_fetch_workers),
+    )
+    build_dir_raw = str(getattr(args, "build_dir", "") or "").strip()
+    evidence_units = []
+    build_id = None
+    ann_index = None
+    ann_shards = None
+    bm25_index = None
+    bm25_shards = None
+    embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
+    shard_count = 1
+    if build_dir_raw:
+        build_dir = Path(build_dir_raw)
+        manifest = json.loads((build_dir / "manifest.json").read_text(encoding="utf-8"))
+        build_id = manifest.get("knowledge_build_id")
+        embedding_model = str(manifest.get("embedding_model") or embedding_model)
+        shard_count = max(1, int(manifest.get("shard_count", 1) or 1))
+        if shard_count > 1:
+            shard_bundles = load_sharded_build(build_dir)
+            ann_shards = []
+            evidence_units = []
+            for units, _embeddings, ann in shard_bundles:
+                evidence_units.extend(units)
+                ann_shards.append(ann)
+            bm25_shards = load_sharded_bm25_indices(build_dir)
+        else:
+            evidence_units, manifest, _embeddings, ann_index = load_build(build_dir)
+            bm25_index = load_bm25_from_build(build_dir)
+            build_id = manifest.get("knowledge_build_id", build_id)
+            embedding_model = str(manifest.get("embedding_model") or embedding_model)
 
     return InvestigationEngine(
-        [],
+        evidence_units,
+        build_id=build_id,
+        ann_index=ann_index,
+        ann_shards=ann_shards,
+        bm25_index=bm25_index,
+        bm25_shards=bm25_shards,
+        embedding_model=embedding_model,
+        shard_count=shard_count,
         enable_cache=True,
         enable_web_fallback=True,
         enable_web_sandbox=enable_web_sandbox,
@@ -301,19 +410,62 @@ def _load_engine_for_runtime(args: argparse.Namespace):
         web_fetch_max_pages=web_fetch_pages,
         web_fetch_crawl_depth=web_fetch_crawl_depth,
         web_fetch_max_workers=max(1, web_fetch_workers),
+        web_fetch_provider=web_fetch_provider,
         enable_knowledge_library=enable_library,
         knowledge_library_dir=Path(library_dir),
+        runtime_tooling=tooling,
     )
 
 
 def _add_runtime_engine_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--knowledge-library-dir", type=str, default=str(Path("artifacts") / "knowledge_library"))
+    parser.add_argument("--build-dir", type=str, default="", help="optional offline build directory to load local evidence and indices")
     parser.add_argument("--enable-knowledge-library", action="store_true", help="persist searches to knowledge library")
     parser.add_argument("--no-web-sandbox", action="store_true", help="disable subprocess isolation for web search")
     parser.add_argument("--web-fetch", action="store_true", help="fetch and parse result pages (HTML/PDF) to create richer evidence")
     parser.add_argument("--web-fetch-pages", type=int, default=4, help="max pages to fetch per query")
     parser.add_argument("--web-fetch-crawl-depth", type=int, default=0, help="extra in-site crawl depth from fetched pages (0~2)")
     parser.add_argument("--web-fetch-workers", type=int, default=4, help="parallel workers for web page fetch")
+    parser.add_argument(
+        "--web-fetch-backend",
+        type=str,
+        default="default",
+        choices=["default", "auto", "stdlib", "sandbox", "playwright", "crawl4ai"],
+        help="optional fetch backend; default preserves existing runtime behavior",
+    )
+    parser.add_argument(
+        "--pii-redaction",
+        type=str,
+        default="off",
+        choices=["off", "auto", "presidio"],
+        help="optional text redaction backend applied to fetched content",
+    )
+    parser.add_argument(
+        "--graph-backend",
+        type=str,
+        default="off",
+        choices=["off", "auto", "neo4j"],
+        help="optional graph export target for diagnostics/analysis metadata",
+    )
+    parser.add_argument("--neo4j-uri", type=str, default="", help="optional Neo4j URI for graph export")
+    parser.add_argument("--neo4j-user", type=str, default="", help="optional Neo4j username")
+    parser.add_argument("--neo4j-password", type=str, default="", help="optional Neo4j password")
+    parser.add_argument("--neo4j-database", type=str, default="", help="optional Neo4j database")
+
+
+def _resolve_web_fetch_provider(backend: str, *, web_fetch_workers: int):
+    selected = str(backend or "default")
+    if selected in {"", "default"}:
+        return None
+    if selected == "stdlib":
+        return StdlibWebFetchProvider(max_workers=max(1, int(web_fetch_workers)))
+    if selected == "sandbox":
+        return SubprocessSandboxWebFetchProvider(max_workers=max(1, int(web_fetch_workers)))
+    if selected == "playwright":
+        return PlaywrightStealthWebFetchProvider()
+    if selected == "crawl4ai":
+        return Crawl4AIWebFetchProvider()
+    raise ValueError(f"unsupported web fetch backend: {selected}")
 
 
 def _ensure_runtime_dependencies(cmd: str) -> None:
@@ -323,6 +475,9 @@ def _ensure_runtime_dependencies(cmd: str) -> None:
     if cmd == "tui":
         reqs.append("requirements-tui.txt")
         fallback_pkgs = ("numpy", "textual")
+    elif cmd == "build":
+        reqs.append("requirements-search.txt")
+        fallback_pkgs = ("numpy",)
     ensure_installed(
         requirements_files=_existing(root, *reqs),
         packages=fallback_pkgs,
@@ -352,4 +507,141 @@ def _existing(root: Path | None, *names: str) -> list[Path]:
         if p.exists():
             paths.append(p)
     return paths
+
+
+def _run_build_command(args: argparse.Namespace) -> int:
+    try:
+        from .crawl_ingest import CrawlIngestConfig, crawl4ai_urls_to_evidence_units
+        from .offline import build_manifest, write_build
+        from .parser import DocumentParser, parse_documents
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise _as_missing_dependency_error(exc, command="build")
+
+    documents = [str(path).strip() for path in list(getattr(args, "document", []) or []) if str(path).strip()]
+    urls = [str(url).strip() for url in list(getattr(args, "url", []) or []) if str(url).strip()]
+    if not documents and not urls:
+        print("At least one --document or --url is required", file=sys.stderr)
+        return 2
+
+    parser = DocumentParser()
+    units = []
+    if documents:
+        units.extend(parse_documents(documents, parser=parser))
+    if urls:
+        units.extend(
+            crawl4ai_urls_to_evidence_units(
+                urls,
+                config=CrawlIngestConfig(
+                    max_pages=max(1, int(args.crawl_max_pages)),
+                    max_text_chars=max(1000, int(args.crawl_max_text_chars)),
+                    fit_markdown=bool(args.crawl_fit_markdown),
+                ),
+            )
+        )
+    if not units:
+        print("No evidence units were produced from the supplied inputs", file=sys.stderr)
+        return 2
+
+    manifest = build_manifest(
+        units,
+        corpus_snapshot_id=str(args.corpus_snapshot_id),
+        parser_version=parser.config.parser_version,
+        embedding_model=str(args.embedding_model),
+    )
+    write_build(
+        output_dir=Path(args.output_dir),
+        evidence_units=units,
+        manifest=manifest,
+        embedding_model=str(args.embedding_model),
+        ann_backend=str(args.ann_backend),
+        shard_count=max(1, int(args.shard_count)),
+    )
+    _print_json(
+        {
+            "ok": True,
+            "output_dir": str(Path(args.output_dir)),
+            "evidence_count": len(units),
+            "document_count": len(documents),
+            "url_count": len(urls),
+            "knowledge_build_id": manifest.get("knowledge_build_id"),
+        }
+    )
+    return 0
+
+
+def _as_missing_dependency_error(exc: BaseException, *, command: str) -> MissingDependencyError:
+    report = _collect_runtime_environment_report(command=command)
+    guidance = report.get("guidance", [])
+    guidance_text = ""
+    if guidance:
+        guidance_text = "\nSuggested next steps:\n- " + "\n- ".join(str(item) for item in guidance)
+    if isinstance(exc, ModuleNotFoundError) and str(getattr(exc, "name", "")) == "numpy":
+        return MissingDependencyError(
+            f"Missing dependency for {command}: numpy. Install requirements-core.txt (numpy>=1.26) "
+            f"or run in the project Python environment before retrying.{guidance_text}"
+        )
+    name = getattr(exc, "name", None)
+    if name:
+        return MissingDependencyError(
+            f"Missing dependency for {command}: {name}. Install the required package or matching requirements file, then retry.{guidance_text}"
+        )
+    return MissingDependencyError(
+        f"{command} could not start due to an import error: {type(exc).__name__}: {exc}{guidance_text}"
+    )
+
+
+def _collect_runtime_environment_report(*, command: str) -> dict[str, object]:
+    root = repo_root()
+    req_core = requirements_path("requirements-core.txt")
+    req_search = requirements_path("requirements-search.txt")
+    req_tui = requirements_path("requirements-tui.txt")
+    pip_cmd = shutil.which("pip3") or shutil.which("pip")
+    pip_module_available = module_available("pip")
+    on_wsl = bool(os.environ.get("WSL_DISTRO_NAME")) or Path("/proc/version").exists() and "microsoft" in Path("/proc/version").read_text(encoding="utf-8", errors="ignore").lower()
+
+    required_modules = ["numpy"]
+    if command == "tui":
+        required_modules.append("textual")
+    missing_modules = [name for name in required_modules if not module_available(name)]
+
+    local_windows_venv = Path(".venv/Scripts/python.exe")
+    local_linux_venv = Path(".venv/bin/python")
+    guidance: list[str] = []
+    if missing_modules:
+        can_run_pip = bool(pip_module_available or pip_cmd)
+        if pip_module_available and req_core is not None:
+            guidance.append(f"{sys.executable} -m pip install -r {req_core.name}")
+        elif pip_cmd and req_core is not None:
+            guidance.append(f"{pip_cmd} install -r {req_core.name}")
+        else:
+            guidance.append("Install pip for this Python first (for example: sudo apt-get install python3-pip)")
+        if can_run_pip and command in {"search", "web", "build"} and req_search is not None:
+            guidance.append(f"{sys.executable} -m pip install -r {req_search.name}")
+        if can_run_pip and command == "tui" and req_tui is not None:
+            guidance.append(f"{sys.executable} -m pip install -r {req_tui.name}")
+        if on_wsl and local_windows_venv.exists() and not local_linux_venv.exists():
+            guidance.append("Detected Windows virtualenv under .venv/Scripts; create/use a Linux venv inside WSL instead")
+
+    return {
+        "command": command,
+        "python_executable": sys.executable,
+        "python_version": sys.version.split()[0],
+        "pip_module_available": pip_module_available,
+        "pip_command": pip_cmd,
+        "repo_root": str(root) if root is not None else None,
+        "requirements": {
+            "core": str(req_core) if req_core is not None else None,
+            "search": str(req_search) if req_search is not None else None,
+            "tui": str(req_tui) if req_tui is not None else None,
+        },
+        "environment": {
+            "auto_install_enabled": auto_install_enabled(),
+            "on_wsl": on_wsl,
+            "windows_venv_python_exists": local_windows_venv.exists(),
+            "linux_venv_python_exists": local_linux_venv.exists(),
+        },
+        "required_modules": required_modules,
+        "missing_modules": missing_modules,
+        "guidance": guidance,
+    }
 

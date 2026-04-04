@@ -7,6 +7,8 @@ import ipaddress
 import os
 import re
 import socket
+import subprocess
+import sys
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -647,6 +649,116 @@ asyncio.run(run())
                 discovered_links=tuple(str(u) for u in (row.get("discovered_links") or [])),
                 error=row.get("error"),
             ))
+        return out
+
+
+@dataclass(frozen=True)
+class Crawl4AIWebFetchProvider:
+    provider_name: str = "crawl4ai-webfetch"
+    timeout_sec: float = 20.0
+    max_text_chars: int = 180_000
+
+    def fetch(self, urls: Sequence[str] | Iterable[str], *, max_pages: int = 5) -> List[WebFetchedPage]:
+        seq = [str(u).strip() for u in list(urls)]
+        seq = [u for u in seq if u][: max(0, int(max_pages))]
+        if not seq:
+            return []
+        try:
+            from crawl4ai import AsyncWebCrawler, CrawlerRunConfig  # type: ignore[import-not-found]
+            from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError("crawl4ai_not_installed") from exc
+
+        async_script = """
+import asyncio, json
+from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
+from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+
+URLS = json.loads({urls_json})
+
+def _extract_markdown(result):
+    markdown = getattr(result, "markdown", "")
+    if isinstance(markdown, str):
+        return markdown
+    fit_markdown = getattr(markdown, "fit_markdown", "")
+    if isinstance(fit_markdown, str) and fit_markdown.strip():
+        return fit_markdown
+    raw_markdown = getattr(markdown, "raw_markdown", "")
+    if isinstance(raw_markdown, str):
+        return raw_markdown
+    return str(markdown or "")
+
+async def main():
+    config = CrawlerRunConfig(markdown_generator=DefaultMarkdownGenerator())
+    out = []
+    async with AsyncWebCrawler() as crawler:
+        for url in URLS:
+            try:
+                result = await crawler.arun(url=url, config=config)
+                markdown = _extract_markdown(result)
+                out.append({{
+                    "url": url,
+                    "final_url": str(getattr(result, "url", url) or url),
+                    "status": 200 if bool(getattr(result, "success", False)) else None,
+                    "content_type": "text/markdown",
+                    "title": str(getattr(result, "title", "") or ""),
+                    "text": markdown[:{max_chars}],
+                    "bytes_read": len(markdown.encode("utf-8")),
+                    "truncated": len(markdown) > {max_chars},
+                    "discovered_links": [],
+                    "error": None if bool(getattr(result, "success", False)) else str(getattr(result, "error_message", "crawl_failed")),
+                }})
+            except Exception as exc:
+                out.append({{
+                    "url": url,
+                    "final_url": url,
+                    "status": None,
+                    "content_type": "",
+                    "title": "",
+                    "text": "",
+                    "bytes_read": 0,
+                    "truncated": False,
+                    "discovered_links": [],
+                    "error": f"crawl4ai_error:{{type(exc).__name__}}",
+                }})
+    print(json.dumps({{"ok": True, "pages": out}}, ensure_ascii=False))
+
+asyncio.run(main())
+"""
+        code = async_script.format(urls_json=repr(json.dumps(seq)), max_chars=int(self.max_text_chars))
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", code],
+                capture_output=True,
+                text=True,
+                timeout=max(2.0, float(self.timeout_sec) + 5.0),
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("crawl4ai_fetch_timeout")
+        raw = (proc.stdout or "").strip()
+        if not raw:
+            err = (proc.stderr or "").strip()
+            raise RuntimeError(f"crawl4ai_fetch_no_output rc={proc.returncode} stderr={err[:180]}")
+        payload = json.loads(raw)
+        pages = payload.get("pages", []) if isinstance(payload, dict) else []
+        out: list[WebFetchedPage] = []
+        for row in pages:
+            if not isinstance(row, dict):
+                continue
+            out.append(
+                WebFetchedPage(
+                    url=str(row.get("url", "")),
+                    final_url=str(row.get("final_url", "")),
+                    status=int(row.get("status", 0) or 0) or None,
+                    content_type=str(row.get("content_type", "")),
+                    title=str(row.get("title", "")),
+                    text=str(row.get("text", "")),
+                    bytes_read=int(row.get("bytes_read", 0) or 0),
+                    truncated=bool(row.get("truncated", False)),
+                    discovered_links=tuple(str(u) for u in (row.get("discovered_links") or [])),
+                    error=row.get("error"),
+                )
+            )
         return out
 
 @dataclass(frozen=True)

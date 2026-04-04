@@ -9,12 +9,13 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .bm25 import BM25Index, build_bm25_index
 from .contradiction import ContradictionDetector, HeuristicContradictionDetector
 from .dsl import ParsedSearchQuery, SearchFilters, apply_search_filters, filter_to_dict, parse_search_query
 from .embedding import DEFAULT_EMBEDDING_MODEL, encode_texts
+from .entity import QueryIntent, classify_query_intent, entity_match_features
 from .index_ann import ANNIndex, build_index
 from .library import KnowledgeLibrary
 from .learning import LearningConfig, OnlineLearningManager
@@ -31,6 +32,7 @@ from .retrieval import (
     retrieve,
 )
 from .schema import EvidenceUnit, ScoredEvidence, SearchResult, SourceCitation, SourceType, Verdict, build_source_citation
+from .tooling import RuntimeTooling
 from .viewer import summarize_stage_scores
 from .webfetch import (
     PlaywrightStealthWebFetchProvider,
@@ -101,6 +103,7 @@ class InvestigationEngine:
         enable_knowledge_library: bool = False,
         knowledge_library_dir: str | Path = Path("artifacts") / "knowledge_library",
         trusted_domains: Sequence[str] | None = None,
+        runtime_tooling: RuntimeTooling | None = None,
     ):
         self.evidence_units = list(evidence_units)
         self.build_id = build_id
@@ -159,6 +162,7 @@ class InvestigationEngine:
                     max_workers=max(1, int(web_fetch_max_workers)),
                 )
         self.trusted_domains = {d.strip().lower() for d in (trusted_domains or []) if str(d).strip()}
+        self.runtime_tooling = runtime_tooling or RuntimeTooling()
         self._library = KnowledgeLibrary(knowledge_library_dir) if enable_knowledge_library else None
         self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
         self._learner = OnlineLearningManager(
@@ -224,17 +228,26 @@ class InvestigationEngine:
         pass_stats["cache"] = {"status": "miss"}
         pass_stats["sharding"] = {"shard_count": self.shard_count}
         pass_stats["online_learning"] = self._learner.snapshot()
+        pass_stats["tooling"] = self.runtime_tooling.to_diagnostics()
         active_weights = self._learner.current_weights()
         active_token_boosts = self._learner.current_token_boosts()
 
         parsed_query = self._parse_query(query)
         query_text = parsed_query.clean_query
+        query_intent = classify_query_intent(query_text)
         pass_stats["query_dsl"] = {
             "enabled": self.enable_search_dsl,
             "raw_query": parsed_query.raw_query,
             "clean_query": parsed_query.clean_query,
             "filters": filter_to_dict(parsed_query.filters),
             "phrase_terms": list(parsed_query.phrase_terms),
+        }
+        pass_stats["query_intent"] = {
+            "kind": query_intent.kind,
+            "focus_name": query_intent.focus_name,
+            "role_terms": list(query_intent.role_terms),
+            "exact_terms": list(query_intent.exact_terms),
+            "requires_exact_name": query_intent.requires_exact_name,
         }
         pass_stats["mode"] = {
             "name": mode_enum.value,
@@ -365,19 +378,19 @@ class InvestigationEngine:
 
         reranked.sort(key=lambda s: s.score, reverse=True)
         best = reranked[: max(effective_top_k, 3)]
+        best, coherence_meta = self._apply_query_consistency_gate(query_text, query_intent, best)
 
         contradictions = [s for s in best if s.verdict == Verdict.CONTRADICTS]
         supports = [s for s in best if s.verdict == Verdict.SUPPORTS]
 
-        if supports:
-            answer = supports[0].evidence.content
-            answer_source = supports[0].source or build_source_citation(supports[0].evidence)
-        elif best:
-            answer = best[0].evidence.content
-            answer_source = best[0].source or build_source_citation(best[0].evidence)
-        else:
-            answer = "근거를 찾지 못했습니다."
-            answer_source = None
+        answer, answer_source = self._select_answer(
+            query_text,
+            query_intent,
+            best=best,
+            supports=supports,
+            contradictions=contradictions,
+            coherence_meta=coherence_meta,
+        )
 
         if not contradictions and best:
             pass_stats["disconfirming_check"] = "insufficient_contradicting_evidence"
@@ -386,24 +399,56 @@ class InvestigationEngine:
             best = self._filter_trusted(best)
             contradictions = [s for s in best if s.verdict == Verdict.CONTRADICTS]
             supports = [s for s in best if s.verdict == Verdict.SUPPORTS]
-            if supports:
-                answer = supports[0].evidence.content
-                answer_source = supports[0].source or build_source_citation(supports[0].evidence)
-            elif best:
-                answer = best[0].evidence.content
-                answer_source = best[0].source or build_source_citation(best[0].evidence)
-            else:
-                answer = "근거를 찾지 못했습니다."
-                answer_source = None
+            answer, answer_source = self._select_answer(
+                query_text,
+                query_intent,
+                best=best,
+                supports=supports,
+                contradictions=contradictions,
+                coherence_meta=coherence_meta,
+            )
 
         sources = self._collect_sources(best)
         if answer_source is not None:
             pass_stats["answer_source"] = answer_source.citation_id
         pass_stats["source_count"] = len(sources)
+        graph_preview = self.runtime_tooling.build_graph_preview(
+            query=query_text,
+            evidence_items=best,
+            contradictions=contradictions,
+        )
+        if graph_preview is not None:
+            pass_stats["tooling"]["graph_preview"] = graph_preview
+            try:
+                pass_stats["tooling"]["graph_export"] = self.runtime_tooling.export_graph(
+                    query=query_text,
+                    evidence_items=best,
+                    contradictions=contradictions,
+                )
+            except Exception as exc:
+                pass_stats["tooling"]["graph_export"] = {
+                    "backend": self.runtime_tooling.graph_backend,
+                    "exported": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            try:
+                pass_stats["tooling"]["graph_related"] = self.runtime_tooling.query_related_graph(
+                    query=query_text,
+                    source_ids=[item.evidence.doc_id for item in best],
+                    limit=5,
+                )
+            except Exception as exc:
+                pass_stats["tooling"]["graph_related"] = {
+                    "backend": self.runtime_tooling.graph_backend,
+                    "queried": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "items": [],
+                }
 
         end_ts = time.time()
         pass_stats["rerank"] = rerank_meta
         pass_stats["contradiction_detector"] = detector_meta
+        pass_stats["result_coherence"] = coherence_meta
         pass_stats["web_fallback"] = web_meta
         pass_stats["entity_groups"] = self._group_by_entity(best)
         pass_stats["elapsed_sec"] = f"{end_ts - start:.3f}"
@@ -866,7 +911,7 @@ class InvestigationEngine:
         now_iso = datetime.now(timezone.utc).isoformat()
         web_units: list[EvidenceUnit] = []
         for row in web_rows:
-            content = (row.snippet or "").strip() or (row.title or "").strip()
+            content = self.runtime_tooling.redact_text((row.snippet or "").strip() or (row.title or "").strip())
             if not content:
                 continue
             url = str(row.url or "").strip()
@@ -928,7 +973,8 @@ class InvestigationEngine:
                         rank = int(getattr(base_row, "rank", 0) or 0) if base_row is not None else 0
                         passes_for_url = sorted(url_passes.get(page.url, set()) | url_passes.get(base_url, set()))
 
-                        chunks = chunk_text(page.text, max_chars=900, overlap=120, min_chars=160)
+                        page_text = self.runtime_tooling.redact_text(page.text)
+                        chunks = chunk_text(page_text, max_chars=900, overlap=120, min_chars=160)
                         if not chunks:
                             continue
                         title = (page.title or (base_row.title if base_row is not None else "") or "").strip()
@@ -1095,6 +1141,44 @@ class InvestigationEngine:
         merged.sort(key=lambda item: item.score, reverse=True)
         return self._dedupe_candidates(merged)[: max(top_n, 1)]
 
+    def _select_answer(
+        self,
+        query: str,
+        intent: QueryIntent,
+        *,
+        best: Sequence[ScoredEvidence],
+        supports: Sequence[ScoredEvidence],
+        contradictions: Sequence[ScoredEvidence],
+        coherence_meta: Mapping[str, object],
+    ) -> tuple[str, SourceCitation | None]:
+        if intent.is_entity_lookup and int(coherence_meta.get("coherent_count", 0) or 0) == 0:
+            detail = intent.focus_name or query
+            return (
+                f"정확히 일치하는 대상(\"{detail}\")을 현재 결과에서 식별하지 못했습니다. "
+                "추가 식별 정보(소속, 과목, 기관 등)를 넣어 다시 검색해 주세요.",
+                None,
+            )
+        if intent.kind == "exact_phrase" and int(coherence_meta.get("coherent_count", 0) or 0) == 0:
+            phrase = intent.quoted_terms[0] if intent.quoted_terms else query
+            return (
+                f"질의 핵심 구문(\"{phrase}\")과 정확히 맞는 근거를 충분히 확보하지 못했습니다. "
+                "따옴표 구문이나 보조 키워드를 조금 더 구체화해 주세요.",
+                None,
+            )
+        if intent.kind in {"verification", "comparison", "timeline"} and int(coherence_meta.get("coherent_count", 0) or 0) == 0:
+            return (
+                "현재 결과만으로는 질문에 대해 충분히 일관된 근거를 확보하지 못했습니다. "
+                "핵심 대상이나 범위를 조금 더 구체적으로 입력해 주세요.",
+                None,
+            )
+        if supports:
+            item = supports[0]
+            return item.evidence.content, item.source or build_source_citation(item.evidence)
+        if best:
+            item = best[0]
+            return item.evidence.content, item.source or build_source_citation(item.evidence)
+        return "근거를 찾지 못했습니다.", None
+
     def _format_answer_for_mode(
         self,
         mode: SearchMode,
@@ -1135,6 +1219,79 @@ class InvestigationEngine:
                 parts.append(f"- {title} ({url})")
             return "\n".join(parts) if len(parts) > 1 else answer
         return answer
+
+    def _apply_query_consistency_gate(
+        self,
+        query: str,
+        intent: QueryIntent,
+        items: Sequence[ScoredEvidence],
+    ) -> tuple[list[ScoredEvidence], dict[str, object]]:
+        ranked = list(items)
+        if not ranked:
+            return ranked, {"applied": False, "reason": "no_candidates"}
+
+        if intent.kind == "general":
+            return ranked, {"applied": False, "reason": "general_query"}
+
+        coherent: list[ScoredEvidence] = []
+        mismatched: list[dict[str, object]] = []
+        for item in ranked:
+            features = entity_match_features(
+                query,
+                item.evidence.content,
+                title=str(item.evidence.metadata.get("title") or item.evidence.section_path or ""),
+            )
+            exact_name = features.get("exact_name_match", 0.0) >= 0.5
+            role_match = not intent.role_terms or features.get("role_name_cooccurrence", 0.0) >= 0.5
+            phrase_match = features.get("exact_phrase_match", 0.0) >= 0.5 or features.get("title_exact_query_match", 0.0) >= 0.5
+            term_match = features.get("all_term_coverage", 0.0) >= 0.66
+            span_match = features.get("ordered_span_match", 0.0) >= 0.5
+            is_coherent = False
+            reason = intent.kind
+            if intent.is_entity_lookup:
+                is_coherent = exact_name and role_match
+                reason = "entity_exact_name_filter"
+            elif intent.kind == "exact_phrase":
+                is_coherent = phrase_match or (term_match and span_match)
+                reason = "exact_phrase_filter"
+            elif intent.kind == "verification":
+                is_coherent = term_match
+                reason = "verification_term_coverage"
+            elif intent.kind in {"comparison", "timeline"}:
+                is_coherent = term_match or span_match
+                reason = f"{intent.kind}_term_coverage"
+            if is_coherent:
+                coherent.append(item)
+            else:
+                mismatched.append(
+                    {
+                        "doc_id": item.evidence.doc_id,
+                        "title": item.evidence.metadata.get("title") or item.evidence.section_path,
+                        "exact_phrase_match": features.get("exact_phrase_match", 0.0),
+                        "exact_name_match": features.get("exact_name_match", 0.0),
+                        "all_term_coverage": features.get("all_term_coverage", 0.0),
+                        "ordered_span_match": features.get("ordered_span_match", 0.0),
+                        "role_name_cooccurrence": features.get("role_name_cooccurrence", 0.0),
+                        "similar_name_penalty": features.get("similar_name_penalty", 0.0),
+                    }
+                )
+
+        if coherent:
+            return coherent + [item for item in ranked if item not in coherent], {
+                "applied": True,
+                "reason": reason,
+                "coherent_count": len(coherent),
+                "mismatched_count": len(mismatched),
+                "mismatched_examples": mismatched[:3],
+            }
+
+        return ranked, {
+            "applied": True,
+            "reason": f"{intent.kind}_not_confident",
+            "coherent_count": 0,
+            "mismatched_count": len(mismatched),
+            "mismatched_examples": mismatched[:3],
+        }
 
     def _filter_trusted(self, items: Sequence[ScoredEvidence]) -> List[ScoredEvidence]:
         if not self.trusted_domains:

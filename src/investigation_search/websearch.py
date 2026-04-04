@@ -215,6 +215,23 @@ def to_evidence_content(results: Sequence[WebSearchResult] | Iterable[WebSearchR
     return [f"{row.title}. {row.snippet}".strip() for row in results]
 
 
+def _format_worker_boot_error(stderr: str, *, worker_name: str) -> str:
+    clean = (stderr or "").strip()
+    if "ModuleNotFoundError: No module named 'numpy'" in clean:
+        return (
+            f"{worker_name}_missing_dependency:numpy; "
+            "install requirements-core.txt (numpy>=1.26) or use a Python environment that already has numpy"
+        )
+    if "ModuleNotFoundError:" in clean:
+        marker = "ModuleNotFoundError:"
+        idx = clean.find(marker)
+        excerpt = clean[idx:].splitlines()[0] if idx >= 0 else clean.splitlines()[-1]
+        return f"{worker_name}_import_error:{excerpt}"
+    if clean:
+        return f"{worker_name}_startup_error:{clean[:180]}"
+    return f"{worker_name}_no_output"
+
+
 @dataclass(frozen=True)
 class SubprocessSandboxWebSearchProvider:
     provider_name: str = "free-osint-subprocess"
@@ -262,7 +279,8 @@ class SubprocessSandboxWebSearchProvider:
         raw = (proc.stdout or "").strip()
         if not raw:
             err = (proc.stderr or "").strip()
-            raise RuntimeError(f"websearch_worker_no_output rc={proc.returncode} stderr={err[:180]}")
+            detail = _format_worker_boot_error(err, worker_name="websearch_worker")
+            raise RuntimeError(f"{detail} rc={proc.returncode}")
         payload = json.loads(raw)
         if not isinstance(payload, dict) or not payload.get("ok"):
             raise RuntimeError(str(payload.get("error") or "websearch_worker_error"))

@@ -33,3 +33,6 @@ artifacts/
 Thumbs.db
 .vscode/
 .idea/
+
+# Temporary: exclude test changes from commit flow
+tests/

@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Mapping, Sequence
 
 from .analyzer import detect_language
+from .entity import classify_query_intent
 from .retrieval import QueryPass, build_passes
 
 
@@ -208,6 +209,9 @@ def profile_for_mode(mode: SearchMode) -> ModeProfile:
 
 def build_passes_for_mode(query: str, mode: SearchMode) -> Sequence[QueryPass]:
     base = list(build_passes(query))
+    intent = classify_query_intent(query)
+    if intent.is_entity_lookup:
+        return tuple(base)
     lang = detect_language(query)
 
     def _add(name: str, suffix: str) -> None:

@@ -7,7 +7,7 @@ from typing import Dict, Iterable, List, Mapping, Sequence
 from .analyzer import detect_language, unique_tokens
 from .bm25 import BM25Index, build_bm25_index, search_bm25
 from .embedding import DEFAULT_EMBEDDING_MODEL, encode_texts
-from .entity import expansion_factor, generate_alias_candidates
+from .entity import QueryIntent, classify_query_intent, entity_match_features, expansion_factor, generate_alias_candidates
 from .index_ann import ANNIndex, search_index
 from .schema import EvidenceUnit, ScoredEvidence, SourceType, Verdict, build_source_citation
 
@@ -59,6 +59,42 @@ def tokenize(text: str, *, use_morphology: bool = False, include_char_ngrams: bo
 
 
 def build_passes(query: str) -> Sequence[QueryPass]:
+    intent = classify_query_intent(query)
+    if intent.is_entity_lookup:
+        entity_query = query.strip()
+        passes = [QueryPass("pass_a_entity_exact", entity_query)]
+        if intent.focus_name and intent.role_terms:
+            role_query = " ".join([*intent.role_terms, intent.focus_name]).strip()
+            if role_query and role_query != entity_query:
+                passes.append(QueryPass("pass_b_role_context", role_query))
+        elif intent.focus_name and intent.focus_name != entity_query:
+                passes.append(QueryPass("pass_b_name_exact", intent.focus_name))
+        return tuple(passes)
+    if intent.kind == "exact_phrase":
+        phrase = intent.quoted_terms[0] if intent.quoted_terms else query.strip()
+        return (
+            QueryPass("pass_a_phrase_exact", phrase),
+            QueryPass("pass_b_phrase_context", query.strip()),
+        )
+    if intent.kind == "verification":
+        return (
+            QueryPass("pass_a_claim", query.strip()),
+            QueryPass("pass_b_source_of_truth", f"{query} 공식 발표 출처 원문 source"),
+            QueryPass("pass_c_counterevidence", f"{query} 반박 오류 정정 반대 근거"),
+        )
+    if intent.kind == "comparison":
+        return (
+            QueryPass("pass_a_compare_exact", query.strip()),
+            QueryPass("pass_b_compare_difference", f"{query} 차이 비교 비교표"),
+            QueryPass("pass_c_compare_evidence", f"{query} 근거 출처"),
+        )
+    if intent.kind == "timeline":
+        return (
+            QueryPass("pass_a_timeline_exact", query.strip()),
+            QueryPass("pass_b_timeline_dates", f"{query} 날짜 시기 연혁 timeline"),
+            QueryPass("pass_c_timeline_sources", f"{query} 출처 기록 원문"),
+        )
+
     lang = detect_language(query)
     if lang == "en":
         contradict_hint = "however exception limitation counter evidence unless not"
@@ -77,8 +113,13 @@ def build_passes(query: str) -> Sequence[QueryPass]:
     )
 
 
-def expand_query_aliases(query: str, max_aliases: int = 5) -> List[ExpandedQuery]:
+def expand_query_aliases(query: str, max_aliases: int = 5, *, intent: QueryIntent | None = None) -> List[ExpandedQuery]:
     expansions: List[ExpandedQuery] = [ExpandedQuery(query=query)]
+    intent = intent or classify_query_intent(query)
+    if not intent.allow_alias_expansion:
+        if intent.focus_name and intent.focus_name != query:
+            expansions.append(ExpandedQuery(query=intent.focus_name, penalty=0.0, reason="focus_name"))
+        return expansions
     for candidate in generate_alias_candidates(query)[:max_aliases]:
         alias = candidate.alias
         if alias == query:
@@ -202,7 +243,8 @@ def retrieve(
     unit_by_key = {_span_key(unit): unit for unit in units}
     weights = weights or RetrievalWeights()
     options = options or RetrievalOptions()
-    expansions = expand_query_aliases(query_pass.query)
+    intent = classify_query_intent(query_pass.query)
+    expansions = expand_query_aliases(query_pass.query, intent=intent)
 
     lexical_scores: dict[tuple[str, int, int], float] = {}
     lexical_penalty: dict[tuple[str, int, int], float] = {}
@@ -286,6 +328,12 @@ def retrieve(
             + weights.lexical * lexical_norm.get(key, 0.0)
             + weights.rrf * rrf_score
         )
+        match_features = entity_match_features(
+            query_pass.query,
+            unit.content,
+            title=str(unit.metadata.get("title") or unit.section_path or ""),
+        )
+        final_score = _apply_entity_adjustments(final_score, match_features=match_features)
         quality_prior = _quality_prior(unit, options=options)
         final_score *= quality_prior
         if final_score <= 0:
@@ -304,6 +352,15 @@ def retrieve(
             "dense": dense_scores.get(key, 0.0),
             "lexical": lexical_scores.get(key, 0.0),
             "rrf": rrf_score,
+            "exact_query_match": match_features.get("exact_query_match", 0.0),
+            "exact_phrase_match": match_features.get("exact_phrase_match", 0.0),
+            "exact_name_match": match_features.get("exact_name_match", 0.0),
+            "title_exact_query_match": match_features.get("title_exact_query_match", 0.0),
+            "title_exact_name_match": match_features.get("title_exact_name_match", 0.0),
+            "role_name_cooccurrence": match_features.get("role_name_cooccurrence", 0.0),
+            "all_term_coverage": match_features.get("all_term_coverage", 0.0),
+            "ordered_span_match": match_features.get("ordered_span_match", 0.0),
+            "similar_name_penalty": match_features.get("similar_name_penalty", 0.0),
             "quality_prior": quality_prior,
             "hybrid": final_score,
         }
@@ -352,6 +409,23 @@ def _quality_prior(unit: EvidenceUnit, *, options: RetrievalOptions) -> float:
             prior *= 1.0 + min(options.max_recency_boost, max(0.0, decay * options.max_recency_boost))
 
     return max(0.0, min(prior, 1.5))
+
+
+def _apply_entity_adjustments(base_score: float, *, match_features: Mapping[str, float]) -> float:
+    score = float(base_score)
+    score *= 1.0 + 0.22 * match_features.get("all_term_coverage", 0.0)
+    score *= 1.0 + 0.12 * match_features.get("ordered_span_match", 0.0)
+    score *= 1.0 + 0.16 * match_features.get("exact_phrase_match", 0.0)
+    score *= 1.0 + 0.12 * match_features.get("title_exact_query_match", 0.0)
+    if match_features.get("intent_entity_lookup", 0.0) >= 0.5:
+        score *= 1.0 + 0.55 * match_features.get("exact_name_match", 0.0)
+        score *= 1.0 + 0.35 * match_features.get("title_exact_name_match", 0.0)
+        score *= 1.0 + 0.22 * match_features.get("role_name_cooccurrence", 0.0)
+        score *= 1.0 + 0.18 * match_features.get("exact_query_match", 0.0)
+        penalty = min(match_features.get("similar_name_penalty", 0.0), 1.0)
+        if penalty > 0 and match_features.get("exact_name_match", 0.0) <= 0:
+            score *= max(0.18, 1.0 - 0.68 * penalty)
+    return score
 
 
 def _age_days(timestamp: str, *, now_utc: datetime | None = None) -> float | None:
