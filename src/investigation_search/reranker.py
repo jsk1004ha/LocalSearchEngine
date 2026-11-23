@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, List, Protocol
 
+from .analyzer import unique_tokens
+from .entity import entity_match_features
 from .schema import ScoredEvidence
 
 
@@ -31,7 +33,23 @@ class LocalCrossEncoderReranker:
                 continue
             overlap = len(query_tokens & evidence_tokens) / len(query_tokens)
             length_norm = min(len(evidence_tokens) / 32.0, 1.0)
-            scored.append(overlap * 0.85 + length_norm * 0.15)
+            match_features = entity_match_features(
+                query,
+                candidate.evidence.content,
+                title=str(candidate.evidence.metadata.get("title") or candidate.evidence.section_path or ""),
+            )
+            score = overlap * 0.78 + length_norm * 0.12
+            score += 0.22 * match_features.get("exact_query_match", 0.0)
+            score += 0.18 * match_features.get("exact_phrase_match", 0.0)
+            score += 0.32 * match_features.get("exact_name_match", 0.0)
+            score += 0.14 * match_features.get("title_exact_query_match", 0.0)
+            score += 0.18 * match_features.get("title_exact_name_match", 0.0)
+            score += 0.12 * match_features.get("role_name_cooccurrence", 0.0)
+            score += 0.16 * match_features.get("all_term_coverage", 0.0)
+            score += 0.10 * match_features.get("ordered_span_match", 0.0)
+            if match_features.get("exact_name_match", 0.0) <= 0:
+                score -= 0.25 * match_features.get("similar_name_penalty", 0.0)
+            scored.append(max(score, 0.0))
         return scored
 
 
@@ -56,4 +74,4 @@ class OnnxRerankerAdapter:
 
 
 def _tokenize(text: str) -> List[str]:
-    return [tok.lower() for tok in text.split() if tok]
+    return list(unique_tokens(text, mode="rerank", include_char_ngrams=True))

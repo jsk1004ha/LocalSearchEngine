@@ -15,6 +15,7 @@ _NEGATION_HINTS = (
     "못",
     "중단",
 )
+_ENGLISH_NEGATION_RE = re.compile(r"\b(?:not|never|cannot|no)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,7 @@ def _tokenize(text: str) -> list[str]:
 
 
 def infer_claim_evidence_relation(claim: str, evidence: str) -> PairInferenceScore:
+    """Return uncalibrated overlap/negation scores, not learned NLI probabilities."""
     claim_tokens = set(_tokenize(claim))
     evidence_tokens = set(_tokenize(evidence))
 
@@ -36,8 +38,8 @@ def infer_claim_evidence_relation(claim: str, evidence: str) -> PairInferenceSco
         return PairInferenceScore(entail=0.0, contradict=0.0, neutral=1.0)
 
     overlap = len(claim_tokens & evidence_tokens) / max(len(claim_tokens), 1)
-    evidence_has_negation = any(hint in evidence for hint in _NEGATION_HINTS)
-    claim_has_negation = any(hint in claim for hint in _NEGATION_HINTS)
+    evidence_has_negation = any(hint in evidence for hint in _NEGATION_HINTS) or bool(_ENGLISH_NEGATION_RE.search(evidence))
+    claim_has_negation = any(hint in claim for hint in _NEGATION_HINTS) or bool(_ENGLISH_NEGATION_RE.search(claim))
 
     entail = min(1.0, overlap * (1.1 if not evidence_has_negation else 0.6))
     contradict = min(

@@ -1,116 +1,288 @@
-# Local Investigation Search Engine
+<p align="center">
+  <h1 align="center">Web Investigation Search Engine</h1>
+  <p align="center">로컬에서 실행되는 <b>웹 조사형(Investigation) 검색 엔진</b> (온라인 웹 검색 기반)</p>
+  <p align="center">
+    <a href="#quick-start">빠른 시작</a> ·
+    <a href="#install">설치</a> ·
+    <a href="#usage">사용법</a> ·
+    <a href="#config">설정</a> ·
+    <a href="#troubleshooting">트러블슈팅</a>
+  </p>
+  <p align="center">
+    <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white">
+    <img alt="version" src="https://img.shields.io/badge/version-0.9.0-blue">
+    <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+    <img alt="status" src="https://img.shields.io/badge/status-experimental-orange">
+  </p>
+</p>
 
-개인용 PC 환경에서 동작하는 **조사형 검색 엔진(Investigation Search Engine)**의 최소 구현체입니다.
-목표는 단순 유사도 검색이 아니라 아래 4가지를 함께 반환하는 것입니다.
+## TL;DR
 
-1. 결론(Answer)
-2. 근거(Evidence spans)
-3. 조건 충족 이유(Why it matches)
-4. 반례/모순(Disconfirming evidence)
+- **SearxNG 기반 웹 멀티패스 하이브리드 검색** (로컬 메타서치)
+- (옵션) 결과 URL **본문 fetch + 파싱**(HTML/PDF/이미지 OCR) + **사이트 내부 링크 크롤**
+- 모든 결과에 `SourceCitation` 포함 (추적 가능한 근거 구조)
+- 모순(contradiction) 단계 + reranker + explain/diagnostics
+- 지식도서관(Knowledge Library) 저장/내보내기/게시
 
-## 구현된 핵심 설계
+<details>
+  <summary><b>Table of Contents</b></summary>
 
-- **오프라인 지식 빌드**
-  - `knowledge_build_id` 생성(코퍼스 스냅샷/파서 버전/임베딩 버전 결합)
-  - evidence 산출물 체크섬 포함 매니페스트 생성
-- **근거 단위 스키마**
-  - `text_sentence`, `table_cell`, `caption`, `ocr_text` source type 지원
-  - 문서 위치(`section_path`, `char_start`, `char_end`)와 신뢰도(`confidence`) 저장
-- **온라인 멀티패스 검색**
-  - Pass A: 정방향
-  - Pass B: 반증(예외/제한/반대 근거 탐색)
-  - Pass C: 경계조건(대상/시점/조건 변경)
-- **진단 정보(Diagnostics)**
-  - 각 pass hit 수, 실행 시간, time budget, 반례 근거 부족 여부 표기
+- [빠른 시작](#quick-start)
+- [설치](#install)
+  - [사전 준비](#prerequisites)
+  - [의존성 설치](#dependencies)
+- [사용법](#usage)
+  - [TUI](#tui)
+  - [CLI 검색](#cli-search)
+  - [웹 UI](#web-ui)
+  - [검색 모드](#modes)
+  - [Knowledge Library](#knowledge-library)
+- [설정](#config)
+  - [환경 변수](#env-vars)
+  - [웹 검색/격리](#web-sandbox)
+- [개발](#development)
+- [기여](#contributing)
+- [트러블슈팅](#troubleshooting)
+- [버전/변경 이력](#changelog)
+- [라이선스](#license)
 
-## 의존성
+</details>
 
-dense 검색 경로를 사용하려면 아래 패키지가 필요합니다.
-
-- `numpy`
-- `sentence-transformers`
-- `hnswlib` 또는 `faiss-cpu` (없으면 exact fallback)
+<a id="quick-start"></a>
 
 ## 빠른 시작
 
-```bash
-python - <<'PY'
-from investigation_search import EvidenceUnit, InvestigationEngine, SourceType
+> 이 프로젝트는 **온라인 웹 검색 기반**으로 동작합니다. 로컬 SearxNG가 필요합니다(기본: `http://127.0.0.1:8080/search`).
 
-units = [
-    EvidenceUnit(
-        doc_id="doc-1",
-        source_type=SourceType.TEXT_SENTENCE,
-        content="로컬 검색 파이프라인은 오프라인 사전 인덱싱으로 지연을 줄일 수 있다.",
-        section_path="1.개요",
-        char_start=0,
-        char_end=36,
-        timestamp="2026-01-01T00:00:00Z",
-        confidence=0.95,
-    ),
-    EvidenceUnit(
-        doc_id="doc-2",
-        source_type=SourceType.TEXT_SENTENCE,
-        content="하지만 작은 메모리 환경에서는 고차원 인덱스가 제한될 수 있다.",
-        section_path="2.제한",
-        char_start=0,
-        char_end=34,
-        timestamp="2026-01-01T00:00:00Z",
-        confidence=0.92,
-    ),
-]
+```powershell
+$env:PYTHONPATH="src"
+$env:INVESTIGATION_SEARCH_AUTO_INSTALL="1"  # (옵션) 실행 중 누락된 선택 의존성 자동 설치
 
-engine = InvestigationEngine(units, build_id="example-build")
-result = engine.search("오프라인 인덱싱으로 지연 개선 가능한가")
-
-print("answer:", result.answer)
-print("diagnostics:", result.diagnostics)
-print("contradictions:", len(result.contradictions))
-PY
+# 웹 검색 TUI 실행 (Textual)
+python -m investigation_search tui --enable-knowledge-library --web-fetch
 ```
 
-> 위 예시는 로컬 패키지 경로를 위해 `PYTHONPATH=src` 또는 설치 후 실행해야 합니다.
+<a id="install"></a>
 
+## 설치
 
-## 임베딩/ANN 권장 설정 (CPU)
+<a id="prerequisites"></a>
 
-- 권장 임베딩 모델
-  - `intfloat/multilingual-e5-small` (384d, 한국어/영어 혼합 질의에 안정적)
-  - `BAAI/bge-small-en-v1.5` (384d, 영문 중심 코퍼스)
-- 권장 인덱스
-  - 기본: HNSW (`M=32`, `ef_construction=200`, `ef_search=64`)
-  - 대규모 데이터(수백만 단위): FAISS IVF (`nlist=256` 이상)
-- 메모리 가이드(대략)
-  - 임베딩 행렬: `문서수 N * 384 * 4 bytes` (float32)
-    - 예: 100,000 span ≈ 146MB
-  - HNSW 그래프 오버헤드: 데이터 분포에 따라 임베딩 메모리의 약 1.2~2.0배 추가
-  - 운영시 여유 메모리(파이썬 런타임/버퍼 포함)로 최소 2~3배를 권장
+### 사전 준비
 
-오프라인 빌드 시 `write_build()`는 다음 산출물을 생성합니다.
+- Python 3.11+
+- (권장) 로컬 SearxNG 실행: 기본 엔드포인트는 `http://127.0.0.1:8080/search`
+- (옵션) OCR을 쓰려면 시스템 `tesseract` 설치 필요 (`pytesseract`는 래퍼)
 
-- `evidence_units.json`
-- `evidence_embeddings.npy`
-- `ann_index.bin`(또는 fallback 시 `ann_index.npy`) + `ann_index.meta.json`
-- `manifest.json`
+<a id="dependencies"></a>
 
-온라인 검색은 lexical 후보와 ANN 후보를 합쳐 `doc_id + (char_start, char_end)` 기준으로 중복 병합한 뒤 재랭킹합니다.
+### 의존성 설치
 
-## 프로젝트 구조
+최소 런타임:
 
-- `src/investigation_search/schema.py`: 근거/판정/result 모델
-- `src/investigation_search/offline.py`: 오프라인 빌드 및 매니페스트
-- `src/investigation_search/retrieval.py`: lexical + dense 후보 결합/중복 병합/판정
-- `src/investigation_search/embedding.py`: 로컬 임베딩 모델 로더/인코딩
-- `src/investigation_search/index_ann.py`: ANN 인덱스 빌드/검색/저장/로딩
-- `src/investigation_search/engine.py`: 시간 예산 기반 조사형 검색 실행기
-- `VERSION`: 프로젝트 버전
-- `agent.md`: 이 저장소에서 작업하는 에이전트용 운영 규칙
+```powershell
+pip install -r requirements-core.txt
+```
 
-## 한계
+TUI:
 
-현재 구현은 lexical 기반 최소 프로토타입입니다. 실제 고성능 운영에서는 다음 확장이 필요합니다.
+```powershell
+pip install -r requirements-tui.txt
+```
 
-- BM25 + Dense + reranker 하이브리드
-- 문서 파서 확장(PDF/표/OCR)
-- contradiction detection 전용 모델
-- 캐시/샤딩/증분 빌드
+선택 기능(필요할 때만):
+
+- 검색(임베딩/ANN): `pip install -r requirements-search.txt`
+- 문서 파싱(PDF/OCR): `pip install -r requirements-docparse.txt`
+- 게시(PDF/zip): `pip install -r requirements-publish.txt`
+- 한국어 형태소(주의: Java/JPype 필요): `pip install -r requirements-ko-morph.txt`
+
+<a id="usage"></a>
+
+## 사용법
+
+<a id="tui"></a>
+
+### TUI
+
+```powershell
+$env:PYTHONPATH="src"
+python -m investigation_search tui --web-fetch --enable-knowledge-library
+```
+
+도움말:
+
+```powershell
+python -m investigation_search tui --help
+```
+
+주요 옵션:
+
+- `--mode`: 기본 검색 모드
+- `--top-k`: 패스별 후보 수
+- `--time-budget`: 시간 예산(초)
+- `--no-web-sandbox`: 웹 검색 서브프로세스 격리 비활성화
+- `--web-fetch`: 결과 URL 본문 fetch 활성화
+- `--web-fetch-pages`: fetch 페이지 수 제한
+- `--web-fetch-crawl-depth`: 사이트 내부 링크 추가 크롤 깊이(0~2)
+- `--web-fetch-workers`: 웹 페이지 fetch 병렬 워커 수
+
+<a id="cli-search"></a>
+
+### CLI 검색
+
+```powershell
+$env:PYTHONPATH="src"
+python -m investigation_search search "오픈소스 LLM 최신 보안 이슈" --mode fbi --top-k 6 --time-budget 90
+```
+
+JSON 출력:
+
+```powershell
+python -m investigation_search search "한국 AI 정책 변화" --json --max-items 10
+```
+
+주요 옵션:
+
+- `--json`: 구조화된 JSON 출력
+- `--max-items`: 출력할 evidence/contradiction 최대 개수
+- `--no-diagnostics`: diagnostics 숨김
+- `--enable-knowledge-library`: 검색 세션 저장
+
+<a id="web-ui"></a>
+
+### 웹 UI
+
+브라우저에서 검색 UI를 실행합니다(스타일: Bento + Glassmorphism + Aurora).
+
+```powershell
+$env:PYTHONPATH="src"
+python -m investigation_search web --host 127.0.0.1 --port 8787 --mode investigation --web-fetch
+```
+
+접속 주소:
+
+- `http://127.0.0.1:8787/`
+
+주요 옵션:
+
+- `--title`: 페이지 제목
+- `--diagnostics-default`: diagnostics를 기본으로 펼침
+- `--top-k`, `--time-budget`, `--max-items`: 기본 검색 파라미터
+- `--web-fetch*`, `--enable-knowledge-library`: 엔진 동작 옵션
+
+<a id="modes"></a>
+
+### 검색 모드
+
+| mode | 의도 |
+| --- | --- |
+| `investigation` | 결론 + 근거 + 반례 + 진단을 균형 있게 제공 |
+| `reporter` | 폭넓고 상세한 자료 수집(웹 fetch 강화) |
+| `fbi` | OSINT 성격의 심층 수집(메타/아카이브/보안 문서 탐색 포함) |
+| `collection` | 자료(논문/데이터셋/레포 등) 중심 수집 |
+| `sniper` | 단 하나의 가장 강한 근거만 최대한 빠르게 선택 |
+| `rumor` | 진위와 무관하게 다양한 주장/의견 수집(라벨링 포함) |
+| `library` | trusted-first 집계(정책에 따라) |
+| `llm` | 로컬 LLM 기반 쿼리 플래닝 → 병렬 검색 → 종합(실험적) |
+
+<a id="knowledge-library"></a>
+
+### Knowledge Library
+
+```powershell
+$env:PYTHONPATH="src"
+python -m investigation_search library list
+python -m investigation_search library show <session_id>
+python -m investigation_search library export --out-dir artifacts/library_export --format html
+python -m investigation_search library serve --dir artifacts/library_export --port 8765
+python -m investigation_search library publish --out artifacts/library_bundle.zip --format zip
+```
+
+<details>
+  <summary><b>주의: 삭제 명령</b></summary>
+
+```powershell
+python -m investigation_search library delete --yes
+```
+
+</details>
+
+<a id="config"></a>
+
+## 설정
+
+<a id="env-vars"></a>
+
+### 환경 변수
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `PYTHONPATH` | (없음) | `src`를 포함해야 `investigation_search`를 import 가능 |
+| `INVESTIGATION_SEARCH_AUTO_INSTALL` | `0` | `1/true/yes/on`이면 선택 의존성을 자동 설치 |
+| `INVESTIGATION_USE_PLAYWRIGHT_FETCH` | `0` | `1`이면 웹 fetch에 Playwright(+stealth)를 사용 |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama 서버 주소 |
+
+<a id="web-sandbox"></a>
+
+### 웹 검색/격리
+
+- 기본 웹 검색은 로컬 SearxNG(`http://127.0.0.1:8080/search`)를 사용합니다.
+- 웹 검색은 기본적으로 **서브프로세스 격리**로 실행됩니다. 제한된 환경에서는 `--no-web-sandbox`가 필요할 수 있습니다.
+
+<details>
+  <summary><b>무료 OSINT 수집망(유료 API 대체) 참고</b></summary>
+
+- 기본 웹 검색: 로컬 SearxNG (`http://127.0.0.1:8080/search`)
+- 과거 데이터: Wayback Machine CDX API
+- 보안/서브도메인 조사: crt.sh / AlienVault OTX (확장용)
+- 차단 우회 fetch: Playwright(+stealth) 옵션 (`INVESTIGATION_USE_PLAYWRIGHT_FETCH=1`)
+- LLM 모드: Ollama 기반 쿼리 플래너 → 병렬 검색 → 근거 종합 답변 생성
+
+</details>
+
+<a id="development"></a>
+
+## 개발
+
+```powershell
+$env:PYTHONPATH="src"
+python -m compileall src
+```
+
+테스트는 `pytest`가 필요합니다(선택):
+
+```powershell
+pip install pytest
+pytest -q
+```
+
+<a id="contributing"></a>
+
+## 기여
+
+- 이슈/PR 환영합니다. 재현 가능한 로그, 최소 재현 예제, 기대 동작을 함께 남겨주세요.
+- 변경 전후로 `python -m compileall src`가 통과하는지 확인해 주세요.
+- 자세한 절차: `CONTRIBUTING.md`
+- 커뮤니티 규칙: `CODE_OF_CONDUCT.md`
+- 보안 취약점 신고: `SECURITY.md`
+- 사용 지원: `SUPPORT.md`
+
+<a id="troubleshooting"></a>
+
+## 트러블슈팅
+
+- `TROUBLESHOOTING.md`를 참고하세요.
+
+<a id="changelog"></a>
+
+## 버전/변경 이력
+
+- 버전 단일 소스: `VERSION`
+- 변경 이력: `CHANGELOG.md`
+
+<a id="license"></a>
+
+## 라이선스
+
+MIT License. 자세한 내용은 `LICENSE`를 참고하세요.

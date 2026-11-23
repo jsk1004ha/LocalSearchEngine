@@ -1,0 +1,7 @@
+# Full install (search + parsing + TUI + publish + optional KO morphology)
+-r requirements-search.txt
+-r requirements-docparse.txt
+-r requirements-tui.txt
+-r requirements-publish.txt
+-r requirements-ko-morph.txt
+
