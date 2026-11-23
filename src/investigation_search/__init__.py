@@ -1,25 +1,128 @@
-from .embedding import DEFAULT_EMBEDDING_MODEL, encode_texts, load_local_model
-from .engine import InvestigationEngine
-from .index_ann import build_index, load_index, save_index, search_index
-from .offline import build_manifest, knowledge_build_id, load_build, write_build
-from .schema import EvidenceUnit, ScoredEvidence, SearchResult, SourceType, Verdict
+from __future__ import annotations
 
-__all__ = [
-    "InvestigationEngine",
-    "build_manifest",
-    "knowledge_build_id",
-    "write_build",
-    "load_build",
-    "build_index",
-    "search_index",
-    "save_index",
-    "load_index",
-    "DEFAULT_EMBEDDING_MODEL",
-    "load_local_model",
-    "encode_texts",
-    "EvidenceUnit",
-    "ScoredEvidence",
-    "SearchResult",
-    "SourceType",
-    "Verdict",
-]
+from importlib import import_module
+
+_EXPORTS: dict[str, tuple[str, str]] = {
+    "detect_language": (".analyzer", "detect_language"),
+    "tokenize": (".analyzer", "tokenize"),
+    "unique_tokens": (".analyzer", "unique_tokens"),
+    "BM25Index": (".bm25", "BM25Index"),
+    "build_bm25_index": (".bm25", "build_bm25_index"),
+    "load_bm25_index": (".bm25", "load_bm25_index"),
+    "save_bm25_index": (".bm25", "save_bm25_index"),
+    "search_bm25": (".bm25", "search_bm25"),
+    "ContradictionDetector": (".contradiction", "ContradictionDetector"),
+    "ContradictionPrediction": (".contradiction", "ContradictionPrediction"),
+    "HeuristicContradictionDetector": (".contradiction", "HeuristicContradictionDetector"),
+    "OnnxContradictionDetectorAdapter": (".contradiction", "OnnxContradictionDetectorAdapter"),
+    "CrawlIngestConfig": (".crawl_ingest", "CrawlIngestConfig"),
+    "CrawledDocument": (".crawl_ingest", "CrawledDocument"),
+    "crawl4ai_urls_to_documents": (".crawl_ingest", "crawl4ai_urls_to_documents"),
+    "crawl4ai_urls_to_evidence_units": (".crawl_ingest", "crawl4ai_urls_to_evidence_units"),
+    "ParsedSearchQuery": (".dsl", "ParsedSearchQuery"),
+    "SearchFilters": (".dsl", "SearchFilters"),
+    "apply_search_filters": (".dsl", "apply_search_filters"),
+    "filter_to_dict": (".dsl", "filter_to_dict"),
+    "parse_search_query": (".dsl", "parse_search_query"),
+    "DEFAULT_EMBEDDING_MODEL": (".embedding", "DEFAULT_EMBEDDING_MODEL"),
+    "encode_texts": (".embedding", "encode_texts"),
+    "load_local_model": (".embedding", "load_local_model"),
+    "InvestigationEngine": (".engine", "InvestigationEngine"),
+    "AliasCandidate": (".entity", "AliasCandidate"),
+    "QueryIntent": (".entity", "QueryIntent"),
+    "classify_query_intent": (".entity", "classify_query_intent"),
+    "entity_match_features": (".entity", "entity_match_features"),
+    "generate_alias_candidates": (".entity", "generate_alias_candidates"),
+    "normalize_masked_entity": (".entity", "normalize_masked_entity"),
+    "EvaluationCase": (".evaluation", "EvaluationCase"),
+    "EvaluationReport": (".evaluation", "EvaluationReport"),
+    "compare_reports": (".evaluation", "compare_reports"),
+    "evaluate_engine": (".evaluation", "evaluate_engine"),
+    "Neo4jGraphExporter": (".graph_export", "Neo4jGraphExporter"),
+    "Neo4jGraphQuerier": (".graph_export", "Neo4jGraphQuerier"),
+    "NoopGraphExporter": (".graph_export", "NoopGraphExporter"),
+    "NoopGraphQuerier": (".graph_export", "NoopGraphQuerier"),
+    "build_graph_exporter": (".graph_export", "build_graph_exporter"),
+    "build_graph_querier": (".graph_export", "build_graph_querier"),
+    "build_index": (".index_ann", "build_index"),
+    "load_index": (".index_ann", "load_index"),
+    "save_index": (".index_ann", "save_index"),
+    "search_index": (".index_ann", "search_index"),
+    "KnowledgeLibrary": (".library", "KnowledgeLibrary"),
+    "export_knowledge_library": (".library_viewer", "export_knowledge_library"),
+    "list_knowledge_library_sessions": (".library_viewer", "list_knowledge_library_sessions"),
+    "load_knowledge_library_session": (".library_viewer", "load_knowledge_library_session"),
+    "LearningConfig": (".learning", "LearningConfig"),
+    "LearningState": (".learning", "LearningState"),
+    "OnlineLearningManager": (".learning", "OnlineLearningManager"),
+    "ModeProfile": (".modes", "ModeProfile"),
+    "SearchMode": (".modes", "SearchMode"),
+    "build_passes_for_mode": (".modes", "build_passes_for_mode"),
+    "parse_mode": (".modes", "parse_mode"),
+    "profile_for_mode": (".modes", "profile_for_mode"),
+    "build_manifest": (".offline", "build_manifest"),
+    "knowledge_build_id": (".offline", "knowledge_build_id"),
+    "load_bm25_from_build": (".offline", "load_bm25_from_build"),
+    "load_build": (".offline", "load_build"),
+    "load_sharded_bm25_indices": (".offline", "load_sharded_bm25_indices"),
+    "load_sharded_build": (".offline", "load_sharded_build"),
+    "write_build": (".offline", "write_build"),
+    "write_build_from_documents": (".offline", "write_build_from_documents"),
+    "OllamaClient": (".ollama", "OllamaClient"),
+    "OllamaContradictionDetector": (".ollama", "OllamaContradictionDetector"),
+    "OllamaRerankerAdapter": (".ollama", "OllamaRerankerAdapter"),
+    "build_osint_graph": (".osint", "build_osint_graph"),
+    "extract_timeline": (".osint", "extract_timeline"),
+    "DocumentParser": (".parser", "DocumentParser"),
+    "ParseConfig": (".parser", "ParseConfig"),
+    "parse_documents": (".parser", "parse_documents"),
+    "publish_knowledge_library_pdf": (".publisher", "publish_knowledge_library_pdf"),
+    "publish_knowledge_library_zip": (".publisher", "publish_knowledge_library_zip"),
+    "LocalCrossEncoderReranker": (".reranker", "LocalCrossEncoderReranker"),
+    "OnnxRerankerAdapter": (".reranker", "OnnxRerankerAdapter"),
+    "build_bm25_for_units": (".retrieval", "build_bm25_for_units"),
+    "RetrievalOptions": (".retrieval", "RetrievalOptions"),
+    "RetrievalWeights": (".retrieval", "RetrievalWeights"),
+    "build_source_citation": (".schema", "build_source_citation"),
+    "EvidenceUnit": (".schema", "EvidenceUnit"),
+    "ScoredEvidence": (".schema", "ScoredEvidence"),
+    "SearchResult": (".schema", "SearchResult"),
+    "SourceCitation": (".schema", "SourceCitation"),
+    "SourceType": (".schema", "SourceType"),
+    "Verdict": (".schema", "Verdict"),
+    "NoopTextRedactor": (".tooling", "NoopTextRedactor"),
+    "OptionalToolStatus": (".tooling", "OptionalToolStatus"),
+    "PresidioTextRedactor": (".tooling", "PresidioTextRedactor"),
+    "RuntimeTooling": (".tooling", "RuntimeTooling"),
+    "build_runtime_tooling": (".tooling", "build_runtime_tooling"),
+    "highlight_text": (".viewer", "highlight_text"),
+    "render_result_text": (".viewer", "render_result_text"),
+    "summarize_stage_scores": (".viewer", "summarize_stage_scores"),
+    "SubprocessSandboxWebFetchProvider": (".webfetch", "SubprocessSandboxWebFetchProvider"),
+    "StdlibWebFetchProvider": (".webfetch", "StdlibWebFetchProvider"),
+    "WebFetchProvider": (".webfetch", "WebFetchProvider"),
+    "WebFetchedPage": (".webfetch", "WebFetchedPage"),
+    "chunk_text": (".webfetch", "chunk_text"),
+    "DuckDuckGoSearchProvider": (".websearch", "DuckDuckGoSearchProvider"),
+    "SubprocessSandboxWebSearchProvider": (".websearch", "SubprocessSandboxWebSearchProvider"),
+    "WebSearchProvider": (".websearch", "WebSearchProvider"),
+    "WebSearchResult": (".websearch", "WebSearchResult"),
+    "WebUiConfig": (".webapp", "WebUiConfig"),
+    "run_web_ui": (".webapp", "run_web_ui"),
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name: str):
+    try:
+        module_name, attr_name = _EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = getattr(import_module(module_name, __name__), attr_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
