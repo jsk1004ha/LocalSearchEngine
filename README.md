@@ -1,121 +1,288 @@
-# Local Investigation Search Engine
+<p align="center">
+  <h1 align="center">Web Investigation Search Engine</h1>
+  <p align="center">로컬에서 실행되는 <b>웹 조사형(Investigation) 검색 엔진</b> (온라인 웹 검색 기반)</p>
+  <p align="center">
+    <a href="#quick-start">빠른 시작</a> ·
+    <a href="#install">설치</a> ·
+    <a href="#usage">사용법</a> ·
+    <a href="#config">설정</a> ·
+    <a href="#troubleshooting">트러블슈팅</a>
+  </p>
+  <p align="center">
+    <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white">
+    <img alt="version" src="https://img.shields.io/badge/version-0.9.0-blue">
+    <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+    <img alt="status" src="https://img.shields.io/badge/status-experimental-orange">
+  </p>
+</p>
 
-개인용 PC 환경에서 동작하는 **조사형 검색 엔진(Investigation Search Engine)** 구현체입니다.
+## TL;DR
 
-이번 버전은 기존 스캐폴드에서 확장되어, 실제 고성능 운영을 위한 다음 기능을 포함합니다.
+- **SearxNG 기반 웹 멀티패스 하이브리드 검색** (로컬 메타서치)
+- (옵션) 결과 URL **본문 fetch + 파싱**(HTML/PDF/이미지 OCR) + **사이트 내부 링크 크롤**
+- 모든 결과에 `SourceCitation` 포함 (추적 가능한 근거 구조)
+- 모순(contradiction) 단계 + reranker + explain/diagnostics
+- 지식도서관(Knowledge Library) 저장/내보내기/게시
 
-- 하이브리드 점수화(lexical + dense-like + rerank)
-- 멀티패스 탐색(정방향/반증/경계조건)
-- 시간 예산 기반 검색 중단/진단
-- 오프라인 빌드 ID + 체크섬 + 재로드
-- **로컬 LLM(Ollama API) 연동**으로 근거 기반 답변 합성
+<details>
+  <summary><b>Table of Contents</b></summary>
 
-## 핵심 개념
+- [빠른 시작](#quick-start)
+- [설치](#install)
+  - [사전 준비](#prerequisites)
+  - [의존성 설치](#dependencies)
+- [사용법](#usage)
+  - [TUI](#tui)
+  - [CLI 검색](#cli-search)
+  - [웹 UI](#web-ui)
+  - [검색 모드](#modes)
+  - [Knowledge Library](#knowledge-library)
+- [설정](#config)
+  - [환경 변수](#env-vars)
+  - [웹 검색/격리](#web-sandbox)
+- [개발](#development)
+- [기여](#contributing)
+- [트러블슈팅](#troubleshooting)
+- [버전/변경 이력](#changelog)
+- [라이선스](#license)
 
-검색 결과는 항상 다음을 목표로 합니다.
+</details>
 
-1. 결론(Answer)
-2. 근거(Evidence spans)
-3. 조건 충족 이유(why it matches)
-4. 반례/모순(Disconfirming evidence)
+<a id="quick-start"></a>
 
-## 설치/실행 (로컬)
+## 빠른 시작
 
-### 1) 오프라인 빌드 산출물 준비
+> 이 프로젝트는 **온라인 웹 검색 기반**으로 동작합니다. 로컬 SearxNG가 필요합니다(기본: `http://127.0.0.1:8080/search`).
 
-빌드 디렉터리에는 아래 두 파일이 있어야 합니다.
+```powershell
+$env:PYTHONPATH="src"
+$env:INVESTIGATION_SEARCH_AUTO_INSTALL="1"  # (옵션) 실행 중 누락된 선택 의존성 자동 설치
 
-- `evidence_units.json`
-- `manifest.json`
-
-오프라인 빌드는 `build_manifest()` + `write_build()`로 생성합니다.
-
-### 2) CLI 검색
-
-```bash
-PYTHONPATH=src python -m investigation_search.cli \
-  --build-dir ./my_build \
-  --query "오프라인 인덱싱으로 지연 개선 가능한가" \
-  --top-k 10 \
-  --time-budget 120
+# 웹 검색 TUI 실행 (Textual)
+python -m investigation_search tui --enable-knowledge-library --web-fetch
 ```
 
-### 3) 로컬 LLM 연결 (Ollama)
+<a id="install"></a>
 
-Ollama가 로컬에서 실행 중일 때:
+## 설치
 
-```bash
-PYTHONPATH=src python -m investigation_search.cli \
-  --build-dir ./my_build \
-  --query "메모리 제약 환경에서 성능 유지 전략은?" \
-  --use-llm \
-  --llm-url http://127.0.0.1:11434 \
-  --llm-model llama3.1:8b
+<a id="prerequisites"></a>
+
+### 사전 준비
+
+- Python 3.11+
+- (권장) 로컬 SearxNG 실행: 기본 엔드포인트는 `http://127.0.0.1:8080/search`
+- (옵션) OCR을 쓰려면 시스템 `tesseract` 설치 필요 (`pytesseract`는 래퍼)
+
+<a id="dependencies"></a>
+
+### 의존성 설치
+
+최소 런타임:
+
+```powershell
+pip install -r requirements-core.txt
 ```
 
-LLM 연결 실패 시 자동으로 heuristic 답변으로 폴백합니다.
+TUI:
 
-## Python API 예시
-
-```python
-from investigation_search import (
-    EvidenceUnit,
-    InvestigationEngine,
-    LLMConfig,
-    SearchConfig,
-    SourceType,
-)
-
-units = [
-    EvidenceUnit(
-        doc_id="doc-1",
-        source_type=SourceType.TEXT_SENTENCE,
-        content="오프라인 사전 인덱싱은 검색 지연 시간을 개선할 수 있다.",
-        section_path="1.개요",
-        char_start=0,
-        char_end=28,
-        timestamp="2026-01-01T00:00:00Z",
-        confidence=0.97,
-    ),
-    EvidenceUnit(
-        doc_id="doc-2",
-        source_type=SourceType.TEXT_SENTENCE,
-        content="반면 메모리가 매우 작으면 고급 인덱스 적용은 제한된다.",
-        section_path="2.제한",
-        char_start=0,
-        char_end=29,
-        timestamp="2026-01-01T00:00:00Z",
-        confidence=0.93,
-    ),
-]
-
-engine = InvestigationEngine(units, build_id="demo-build")
-result = engine.search(
-    "오프라인 인덱싱으로 지연 개선 가능한가",
-    config=SearchConfig(top_k_per_pass=8, final_top_k=12, time_budget_sec=120),
-    llm_config=LLMConfig(base_url="http://127.0.0.1:11434", model="llama3.1:8b"),
-)
-
-print(result.answer)
-print(result.diagnostics)
+```powershell
+pip install -r requirements-tui.txt
 ```
 
-## 프로젝트 구조
+선택 기능(필요할 때만):
 
-- `src/investigation_search/schema.py`: 데이터 모델 + 검색 설정
-- `src/investigation_search/retrieval.py`: 하이브리드 점수화 + 패스별 회수
-- `src/investigation_search/engine.py`: 전체 탐색/시간예산/답변 합성 orchestration
-- `src/investigation_search/llm.py`: 로컬 LLM(Ollama API) 연결 및 폴백
-- `src/investigation_search/offline.py`: 오프라인 빌드/매니페스트/재로드
-- `src/investigation_search/cli.py`: 실행용 CLI
-- `agent.md`: 저장소 작업 원칙
-- `VERSION`: 프로젝트 버전
+- 검색(임베딩/ANN): `pip install -r requirements-search.txt`
+- 문서 파싱(PDF/OCR): `pip install -r requirements-docparse.txt`
+- 게시(PDF/zip): `pip install -r requirements-publish.txt`
+- 한국어 형태소(주의: Java/JPype 필요): `pip install -r requirements-ko-morph.txt`
 
-## 한계 및 다음 단계
+<a id="usage"></a>
 
-현재 dense는 외부 임베딩 모델 없이 동작하는 dense-like cosine 방식입니다. 실운영 고성능화 시:
+## 사용법
 
-- 실제 임베딩 모델(e5/bge 등) + ANN 인덱스(FAISS/HNSW)
-- 크로스 인코더 reranker
-- contradiction 분류기 별도 학습/서빙
-- 증분 인덱싱 파이프라인
+<a id="tui"></a>
+
+### TUI
+
+```powershell
+$env:PYTHONPATH="src"
+python -m investigation_search tui --web-fetch --enable-knowledge-library
+```
+
+도움말:
+
+```powershell
+python -m investigation_search tui --help
+```
+
+주요 옵션:
+
+- `--mode`: 기본 검색 모드
+- `--top-k`: 패스별 후보 수
+- `--time-budget`: 시간 예산(초)
+- `--no-web-sandbox`: 웹 검색 서브프로세스 격리 비활성화
+- `--web-fetch`: 결과 URL 본문 fetch 활성화
+- `--web-fetch-pages`: fetch 페이지 수 제한
+- `--web-fetch-crawl-depth`: 사이트 내부 링크 추가 크롤 깊이(0~2)
+- `--web-fetch-workers`: 웹 페이지 fetch 병렬 워커 수
+
+<a id="cli-search"></a>
+
+### CLI 검색
+
+```powershell
+$env:PYTHONPATH="src"
+python -m investigation_search search "오픈소스 LLM 최신 보안 이슈" --mode fbi --top-k 6 --time-budget 90
+```
+
+JSON 출력:
+
+```powershell
+python -m investigation_search search "한국 AI 정책 변화" --json --max-items 10
+```
+
+주요 옵션:
+
+- `--json`: 구조화된 JSON 출력
+- `--max-items`: 출력할 evidence/contradiction 최대 개수
+- `--no-diagnostics`: diagnostics 숨김
+- `--enable-knowledge-library`: 검색 세션 저장
+
+<a id="web-ui"></a>
+
+### 웹 UI
+
+브라우저에서 검색 UI를 실행합니다(스타일: Bento + Glassmorphism + Aurora).
+
+```powershell
+$env:PYTHONPATH="src"
+python -m investigation_search web --host 127.0.0.1 --port 8787 --mode investigation --web-fetch
+```
+
+접속 주소:
+
+- `http://127.0.0.1:8787/`
+
+주요 옵션:
+
+- `--title`: 페이지 제목
+- `--diagnostics-default`: diagnostics를 기본으로 펼침
+- `--top-k`, `--time-budget`, `--max-items`: 기본 검색 파라미터
+- `--web-fetch*`, `--enable-knowledge-library`: 엔진 동작 옵션
+
+<a id="modes"></a>
+
+### 검색 모드
+
+| mode | 의도 |
+| --- | --- |
+| `investigation` | 결론 + 근거 + 반례 + 진단을 균형 있게 제공 |
+| `reporter` | 폭넓고 상세한 자료 수집(웹 fetch 강화) |
+| `fbi` | OSINT 성격의 심층 수집(메타/아카이브/보안 문서 탐색 포함) |
+| `collection` | 자료(논문/데이터셋/레포 등) 중심 수집 |
+| `sniper` | 단 하나의 가장 강한 근거만 최대한 빠르게 선택 |
+| `rumor` | 진위와 무관하게 다양한 주장/의견 수집(라벨링 포함) |
+| `library` | trusted-first 집계(정책에 따라) |
+| `llm` | 로컬 LLM 기반 쿼리 플래닝 → 병렬 검색 → 종합(실험적) |
+
+<a id="knowledge-library"></a>
+
+### Knowledge Library
+
+```powershell
+$env:PYTHONPATH="src"
+python -m investigation_search library list
+python -m investigation_search library show <session_id>
+python -m investigation_search library export --out-dir artifacts/library_export --format html
+python -m investigation_search library serve --dir artifacts/library_export --port 8765
+python -m investigation_search library publish --out artifacts/library_bundle.zip --format zip
+```
+
+<details>
+  <summary><b>주의: 삭제 명령</b></summary>
+
+```powershell
+python -m investigation_search library delete --yes
+```
+
+</details>
+
+<a id="config"></a>
+
+## 설정
+
+<a id="env-vars"></a>
+
+### 환경 변수
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `PYTHONPATH` | (없음) | `src`를 포함해야 `investigation_search`를 import 가능 |
+| `INVESTIGATION_SEARCH_AUTO_INSTALL` | `0` | `1/true/yes/on`이면 선택 의존성을 자동 설치 |
+| `INVESTIGATION_USE_PLAYWRIGHT_FETCH` | `0` | `1`이면 웹 fetch에 Playwright(+stealth)를 사용 |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama 서버 주소 |
+
+<a id="web-sandbox"></a>
+
+### 웹 검색/격리
+
+- 기본 웹 검색은 로컬 SearxNG(`http://127.0.0.1:8080/search`)를 사용합니다.
+- 웹 검색은 기본적으로 **서브프로세스 격리**로 실행됩니다. 제한된 환경에서는 `--no-web-sandbox`가 필요할 수 있습니다.
+
+<details>
+  <summary><b>무료 OSINT 수집망(유료 API 대체) 참고</b></summary>
+
+- 기본 웹 검색: 로컬 SearxNG (`http://127.0.0.1:8080/search`)
+- 과거 데이터: Wayback Machine CDX API
+- 보안/서브도메인 조사: crt.sh / AlienVault OTX (확장용)
+- 차단 우회 fetch: Playwright(+stealth) 옵션 (`INVESTIGATION_USE_PLAYWRIGHT_FETCH=1`)
+- LLM 모드: Ollama 기반 쿼리 플래너 → 병렬 검색 → 근거 종합 답변 생성
+
+</details>
+
+<a id="development"></a>
+
+## 개발
+
+```powershell
+$env:PYTHONPATH="src"
+python -m compileall src
+```
+
+테스트는 `pytest`가 필요합니다(선택):
+
+```powershell
+pip install pytest
+pytest -q
+```
+
+<a id="contributing"></a>
+
+## 기여
+
+- 이슈/PR 환영합니다. 재현 가능한 로그, 최소 재현 예제, 기대 동작을 함께 남겨주세요.
+- 변경 전후로 `python -m compileall src`가 통과하는지 확인해 주세요.
+- 자세한 절차: `CONTRIBUTING.md`
+- 커뮤니티 규칙: `CODE_OF_CONDUCT.md`
+- 보안 취약점 신고: `SECURITY.md`
+- 사용 지원: `SUPPORT.md`
+
+<a id="troubleshooting"></a>
+
+## 트러블슈팅
+
+- `TROUBLESHOOTING.md`를 참고하세요.
+
+<a id="changelog"></a>
+
+## 버전/변경 이력
+
+- 버전 단일 소스: `VERSION`
+- 변경 이력: `CHANGELOG.md`
+
+<a id="license"></a>
+
+## 라이선스
+
+MIT License. 자세한 내용은 `LICENSE`를 참고하세요.
