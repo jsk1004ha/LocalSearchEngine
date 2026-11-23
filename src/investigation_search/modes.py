@@ -215,7 +215,7 @@ def build_passes_for_mode(query: str, mode: SearchMode) -> Sequence[QueryPass]:
     lang = detect_language(query)
 
     def _add(name: str, suffix: str) -> None:
-        base.append(QueryPass(name=name, query=f"{query} {suffix}".strip()))
+        base.append(QueryPass(name=name, query=f"{query} {suffix}".strip(), claim=query))
 
     if mode in {SearchMode.REPORTER, SearchMode.FBI, SearchMode.COLLECTION, SearchMode.RUMOR, SearchMode.LLM}:
         if lang == "en":

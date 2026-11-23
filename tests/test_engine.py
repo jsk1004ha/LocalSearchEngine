@@ -135,8 +135,16 @@ def test_search_rerank_enabled_adds_diagnostics_and_stage_scores() -> None:
 def test_search_rerank_skipped_when_time_budget_exceeded_keeps_sorted_scores() -> None:
     engine = InvestigationEngine(_sample_units())
 
-    fake_times = [0.0, 0.0, 0.0, 0.0, 119.995, 120.0]
-    with patch("investigation_search.engine.time.time", side_effect=fake_times):
+    clock = [0.0]
+    retrieve_from_shards = engine._retrieve_from_shards
+
+    def retrieve_until_deadline(*args, **kwargs):
+        hits = retrieve_from_shards(*args, **kwargs)
+        clock[0] = 120.0
+        return hits
+
+    with patch("investigation_search.engine.time.time", side_effect=lambda: clock[0]), \
+            patch.object(engine, "_retrieve_from_shards", side_effect=retrieve_until_deadline):
         result = engine.search("처리 속도 개선", top_k_per_pass=2, time_budget_sec=120)
 
     assert result.diagnostics["rerank"]["reason"] == "time_budget_exceeded"

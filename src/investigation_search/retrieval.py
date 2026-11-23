@@ -10,12 +10,14 @@ from .embedding import DEFAULT_EMBEDDING_MODEL, encode_texts
 from .entity import QueryIntent, classify_query_intent, entity_match_features, expansion_factor, generate_alias_candidates
 from .index_ann import ANNIndex, search_index
 from .schema import EvidenceUnit, ScoredEvidence, SourceType, Verdict, build_source_citation
+from .verification import infer_claim_evidence_relation
 
 
 @dataclass(frozen=True)
 class QueryPass:
     name: str
     query: str
+    claim: str | None = None
 
 
 @dataclass(frozen=True)
@@ -59,40 +61,43 @@ def tokenize(text: str, *, use_morphology: bool = False, include_char_ngrams: bo
 
 
 def build_passes(query: str) -> Sequence[QueryPass]:
+    def make_pass(name: str, search_query: str) -> QueryPass:
+        return QueryPass(name, search_query, claim=query)
+
     intent = classify_query_intent(query)
     if intent.is_entity_lookup:
         entity_query = query.strip()
-        passes = [QueryPass("pass_a_entity_exact", entity_query)]
+        passes = [make_pass("pass_a_entity_exact", entity_query)]
         if intent.focus_name and intent.role_terms:
             role_query = " ".join([*intent.role_terms, intent.focus_name]).strip()
             if role_query and role_query != entity_query:
-                passes.append(QueryPass("pass_b_role_context", role_query))
+                passes.append(make_pass("pass_b_role_context", role_query))
         elif intent.focus_name and intent.focus_name != entity_query:
-                passes.append(QueryPass("pass_b_name_exact", intent.focus_name))
+                passes.append(make_pass("pass_b_name_exact", intent.focus_name))
         return tuple(passes)
     if intent.kind == "exact_phrase":
         phrase = intent.quoted_terms[0] if intent.quoted_terms else query.strip()
         return (
-            QueryPass("pass_a_phrase_exact", phrase),
-            QueryPass("pass_b_phrase_context", query.strip()),
+            make_pass("pass_a_phrase_exact", phrase),
+            make_pass("pass_b_phrase_context", query.strip()),
         )
     if intent.kind == "verification":
         return (
-            QueryPass("pass_a_claim", query.strip()),
-            QueryPass("pass_b_source_of_truth", f"{query} 공식 발표 출처 원문 source"),
-            QueryPass("pass_c_counterevidence", f"{query} 반박 오류 정정 반대 근거"),
+            make_pass("pass_a_claim", query.strip()),
+            make_pass("pass_b_source_of_truth", f"{query} 공식 발표 출처 원문 source"),
+            make_pass("pass_c_counterevidence", f"{query} 반박 오류 정정 반대 근거"),
         )
     if intent.kind == "comparison":
         return (
-            QueryPass("pass_a_compare_exact", query.strip()),
-            QueryPass("pass_b_compare_difference", f"{query} 차이 비교 비교표"),
-            QueryPass("pass_c_compare_evidence", f"{query} 근거 출처"),
+            make_pass("pass_a_compare_exact", query.strip()),
+            make_pass("pass_b_compare_difference", f"{query} 차이 비교 비교표"),
+            make_pass("pass_c_compare_evidence", f"{query} 근거 출처"),
         )
     if intent.kind == "timeline":
         return (
-            QueryPass("pass_a_timeline_exact", query.strip()),
-            QueryPass("pass_b_timeline_dates", f"{query} 날짜 시기 연혁 timeline"),
-            QueryPass("pass_c_timeline_sources", f"{query} 출처 기록 원문"),
+            make_pass("pass_a_timeline_exact", query.strip()),
+            make_pass("pass_b_timeline_dates", f"{query} 날짜 시기 연혁 timeline"),
+            make_pass("pass_c_timeline_sources", f"{query} 출처 기록 원문"),
         )
 
     lang = detect_language(query)
@@ -107,9 +112,17 @@ def build_passes(query: str) -> Sequence[QueryPass]:
         boundary_hint = "조건 시점 대상 변경 경계 사례 edge case boundary"
 
     return (
-        QueryPass("pass_a_support", query),
-        QueryPass("pass_b_contradict", f"{query} {contradict_hint}"),
-        QueryPass("pass_c_boundary", f"{query} {boundary_hint}"),
+        make_pass("pass_a_support", query),
+        make_pass("pass_b_contradict", f"{query} {contradict_hint}"),
+        make_pass("pass_c_boundary", f"{query} {boundary_hint}"),
+    )
+
+
+def build_disconfirming_pass(query: str) -> QueryPass:
+    return QueryPass(
+        name="pass_d_disconfirming",
+        query=f"{query} 부정 예외 반증 제한 실패 counter evidence exception failure",
+        claim=query,
     )
 
 
@@ -174,13 +187,18 @@ def lexical_score(
     return inter_weight / max(query_weight, 1e-9)
 
 
-def classify_verdict(pass_name: str, evidence_text: str) -> Verdict:
-    contradiction_hints = ["아니다", "없다", "제한", "예외", "반면", "불가"]
-    support_hints = ["가능", "효과", "충족", "성공", "개선"]
-
-    if pass_name == "pass_b_contradict" or any(k in evidence_text for k in contradiction_hints):
+def classify_verdict(
+    pass_name: str,
+    evidence_text: str,
+    *,
+    claim: str | None = None,
+    contradiction_threshold: float = 0.5,
+) -> Verdict:
+    # Search intent alone cannot label a returned document as counterevidence.
+    relation = infer_claim_evidence_relation(claim or "", evidence_text)
+    if relation.contradict >= contradiction_threshold:
         return Verdict.CONTRADICTS
-    if any(k in evidence_text for k in support_hints):
+    if relation.entail >= 0.45:
         return Verdict.SUPPORTS
     return Verdict.UNCERTAIN
 
@@ -244,6 +262,7 @@ def retrieve(
     weights = weights or RetrievalWeights()
     options = options or RetrievalOptions()
     intent = classify_query_intent(query_pass.query)
+    claim = query_pass.claim if query_pass.claim is not None else query_pass.query
     expansions = expand_query_aliases(query_pass.query, intent=intent)
 
     lexical_scores: dict[tuple[str, int, int], float] = {}
@@ -339,7 +358,8 @@ def retrieve(
         if final_score <= 0:
             continue
 
-        why_parts = [f"{query_pass.name}: hybrid"]
+        relation = infer_claim_evidence_relation(claim, unit.content)
+        why_parts = [f"{query_pass.name}: hybrid", f"entail={relation.entail:.2f}", f"contradict={relation.contradict:.2f}"]
         if key in bm25_scores:
             why_parts.append(f"bm25={bm25_scores[key]:.3f}")
         if key in dense_scores:
@@ -348,6 +368,9 @@ def retrieve(
             why_parts.append(f"lexical={lexical_scores[key]:.3f}")
 
         stage_scores = {
+            "pair_entail": relation.entail,
+            "pair_contradict": relation.contradict,
+            "pair_neutral": relation.neutral,
             "bm25": bm25_scores.get(key, 0.0),
             "dense": dense_scores.get(key, 0.0),
             "lexical": lexical_scores.get(key, 0.0),
@@ -373,7 +396,7 @@ def retrieve(
             ScoredEvidence(
                 evidence=unit,
                 score=final_score,
-                verdict=classify_verdict(query_pass.name, unit.content),
+                verdict=classify_verdict(query_pass.name, unit.content, claim=claim),
                 why_it_matches=", ".join(why_parts),
                 stage_scores=stage_scores,
                 source=build_source_citation(unit),

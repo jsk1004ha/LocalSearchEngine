@@ -28,6 +28,7 @@ from .retrieval import (
     RetrievalOptions,
     RetrievalWeights,
     build_bm25_for_units,
+    build_disconfirming_pass,
     build_passes,
     retrieve,
 )
@@ -268,6 +269,8 @@ class InvestigationEngine:
         else:
             passes = tuple(build_passes_for_mode(query_text, mode_enum))
 
+        passes = tuple(replace(qp, claim=query_text) for qp in passes)
+
         for qp in passes:
             elapsed = time.time() - start
             remaining = time_budget_sec - elapsed
@@ -278,6 +281,7 @@ class InvestigationEngine:
             hits, shard_hits = self._retrieve_from_shards(
                 qp.query,
                 qp.name,
+                claim=query_text,
                 top_k=effective_top_k,
                 weights=active_weights,
                 token_boosts=active_token_boosts,
@@ -383,6 +387,57 @@ class InvestigationEngine:
         contradictions = [s for s in best if s.verdict == Verdict.CONTRADICTS]
         supports = [s for s in best if s.verdict == Verdict.SUPPORTS]
 
+        if not contradictions and best:
+            elapsed = time.time() - start
+            if time_budget_sec - elapsed <= 0:
+                pass_stats["pass_d_disconfirming"] = "skipped_time_budget"
+            else:
+                qp = build_disconfirming_pass(query_text)
+                extra_hits, shard_hits = self._retrieve_from_shards(
+                    qp.query, qp.name, claim=query_text, top_k=effective_top_k,
+                    weights=active_weights, token_boosts=active_token_boosts,
+                    time_budget_sec=time_budget_sec, elapsed_sec=elapsed,
+                    filters=parsed_query.filters, retrieval_options=effective_retrieval_options,
+                )
+                extra_meta: Dict[str, object] = {"hits": len(extra_hits), "shards": shard_hits}
+                if enable_web and self._web_allowed_by_filters(parsed_query.filters):
+                    if time_budget_sec - (time.time() - start) > 0:
+                        web_hits, extra_web_meta, _ = self._web_fallback(
+                            query_text, passes=(qp,), filters=parsed_query.filters,
+                            web_meta={"enabled": True, "used": False},
+                            score_base=profile.web_score_base, max_results=profile.web_max_results,
+                            top_k=effective_top_k, weights=active_weights,
+                            token_boosts=active_token_boosts, retrieval_options=effective_retrieval_options,
+                            enable_web_fetch=False, web_fetch_max_pages=0, web_fetch_crawl_depth=0,
+                        )
+                        extra_hits.extend(web_hits)
+                        extra_meta["web"] = extra_web_meta
+                    else:
+                        extra_meta["web"] = {"reason": "skipped_time_budget"}
+                extra_meta["candidate_hits"] = len(extra_hits)
+                # Counter-query suffixes must not introduce unrelated evidence.
+                extra_hits = [
+                    item for item in extra_hits
+                    if max(item.stage_scores.get("pair_entail", 0.0), item.stage_scores.get("pair_contradict", 0.0)) > 0
+                ]
+                extra_meta["hits"] = len(extra_hits)
+                pass_stats[qp.name] = extra_meta
+                if extra_hits:
+                    selected = self._dedupe_candidates([*selected, *extra_hits])
+                    remaining = time_budget_sec - (time.time() - start)
+                    if remaining > 0.015 * max(len(selected), 1) + 0.01:
+                        reranked = self._rerank(query_text, selected, max_candidates=profile.max_rerank_candidates)
+                        extra_meta["rerank"] = "applied"
+                    else:
+                        reranked = self._dedupe_candidates([*reranked, *self._annotate_initial_scores(extra_hits)])
+                        extra_meta["rerank"] = "skipped_time_budget"
+                    reranked, detector_meta = self._apply_contradiction_detector(query_text, reranked, detector_meta)
+                    reranked.sort(key=lambda item: item.score, reverse=True)
+                    best = reranked[: max(effective_top_k, 3)]
+                    best, coherence_meta = self._apply_query_consistency_gate(query_text, query_intent, best)
+                    contradictions = [item for item in best if item.verdict == Verdict.CONTRADICTS]
+                    supports = [item for item in best if item.verdict == Verdict.SUPPORTS]
+
         answer, answer_source = self._select_answer(
             query_text,
             query_intent,
@@ -407,6 +462,12 @@ class InvestigationEngine:
                 contradictions=contradictions,
                 coherence_meta=coherence_meta,
             )
+
+        pass_stats["evidence_confidence"] = {
+            "method": "heuristic_pair_score",
+            "supports": round(max((item.stage_scores.get("pair_entail", 0.0) for item in supports), default=0.0), 4),
+            "contradicts": round(max((item.stage_scores.get("pair_contradict", 0.0) for item in contradictions), default=0.0), 4),
+        }
 
         sources = self._collect_sources(best)
         if answer_source is not None:
@@ -569,6 +630,7 @@ class InvestigationEngine:
         elapsed_sec: float,
         filters: SearchFilters,
         retrieval_options: RetrievalOptions,
+        claim: str | None = None,
     ) -> tuple[List[ScoredEvidence], Dict[str, int]]:
         shard_hits: dict[str, int] = {}
         all_hits: list[ScoredEvidence] = []
@@ -585,7 +647,7 @@ class InvestigationEngine:
                 continue
             can_reuse_shard_indexes = len(filtered_units) == len(shard.units)
             hits = retrieve(
-                query_pass=QueryPass(name=pass_name, query=query),
+                query_pass=QueryPass(name=pass_name, query=query, claim=claim),
                 evidence_units=filtered_units,
                 top_k=max(top_k, 2),
                 bm25_index=shard.bm25_index if can_reuse_shard_indexes else None,

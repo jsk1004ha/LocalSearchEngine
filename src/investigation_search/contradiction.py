@@ -3,12 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, List, Protocol
 
-from .analyzer import unique_tokens
 from .schema import ScoredEvidence, Verdict
-
-
-def _tokenize(text: str) -> set[str]:
-    return unique_tokens(text, mode="classification", include_char_ngrams=True)
+from .verification import infer_claim_evidence_relation
 
 
 @dataclass(frozen=True)
@@ -29,39 +25,21 @@ class ContradictionDetector(Protocol):
 @dataclass(frozen=True)
 class HeuristicContradictionDetector:
     model_name: str = "heuristic-contradiction-detector"
-    model_version: str = "0.1"
+    model_version: str = "0.2"
     contradiction_threshold: float = 0.55
 
     def predict(self, query: str, candidates: Iterable[ScoredEvidence]) -> List[ContradictionPrediction]:
-        contradiction_hints = {"아니다", "없다", "제한", "예외", "불가", "반면", "not", "never", "cannot"}
-        support_hints = {"가능", "효과", "개선", "충족", "성공", "improve", "support"}
-        query_tokens = _tokenize(query)
-
         out: list[ContradictionPrediction] = []
         for candidate in candidates:
-            text = candidate.evidence.content
-            evidence_tokens = _tokenize(text)
-            overlap = 0.0
-            if query_tokens and evidence_tokens:
-                overlap = len(query_tokens & evidence_tokens) / len(query_tokens)
-
-            has_contradiction_hint = any(hint in text for hint in contradiction_hints)
-            has_support_hint = any(hint in text for hint in support_hints)
-
-            if has_contradiction_hint:
-                score = min(0.55 + overlap * 0.45, 0.99)
-                verdict = Verdict.CONTRADICTS
-                rationale = "contradiction_hint+overlap"
-            elif has_support_hint:
-                score = min(0.5 + overlap * 0.45, 0.95)
-                verdict = Verdict.SUPPORTS
-                rationale = "support_hint+overlap"
+            relation = infer_claim_evidence_relation(query, candidate.evidence.content)
+            if relation.contradict >= self.contradiction_threshold:
+                verdict, score, rationale = Verdict.CONTRADICTS, relation.contradict, "pair_contradiction"
+            elif relation.entail >= 0.45 and relation.entail > relation.contradict:
+                verdict, score, rationale = Verdict.SUPPORTS, relation.entail, "pair_entailment"
             else:
-                score = max(0.15, overlap * 0.5)
-                verdict = Verdict.UNCERTAIN
-                rationale = "weak_semantic_signal"
-
+                verdict, score, rationale = Verdict.UNCERTAIN, relation.neutral, "pair_neutral"
             out.append(ContradictionPrediction(verdict=verdict, score=score, rationale=rationale))
+
         return out
 
 
